@@ -3,7 +3,7 @@
 四个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事
 串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
 
-纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 180 项全部通过。
+纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 231 项全部通过。
 
 > 一个用于学习推理服务的 CPU 实验仓库，覆盖显存估算、块生命周期、调度模拟和流式度量。
 > 示例输出包含确定性模拟和本地 HTTP mock；真实 GPU 性能验证尚未完成。见 [能力边界](#能力边界)。
@@ -29,7 +29,7 @@ cd kv-serve-lab
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python3 -m pytest          # 180 passed
+python3 -m pytest          # 231 passed
 python3 examples/demo.py   # 四模块闭环，全程无 GPU
 ```
 
@@ -230,8 +230,11 @@ usage.completion_tokens; do NOT count chunks.
 
 ## 能力边界
 
-集成层使用保守的整请求 KV 预留，事后回放块生命周期；尚未实现逐 token 块增长、
-内存压力抢占或块不足时的调度反馈。Little’s law 的人口积分在每步独立记录，包含排队请求。
+集成层使用保守的整请求 KV 预留，事后回放块生命周期。`schedsim` 已实现逐 token 块增长、
+内存压力抢占（对齐 vLLM v1 RECOMPUTE 语义）与块不足时的调度反馈；块生命周期回放使用
+整数键（2×start / 2×finish+1）保证同步先分配后释放。Little’s law 的人口积分在每步独立记录，
+包含排队请求。块管理器另有 **C++17 与 Python 双实现逐操作对拍**（`tests/test_cpp_differential.py`，
+6 个种子随机脚本 + LIFO/FIFO/COW/守恒四条定向用例）。
 
 这份清单是给读 README 的人（包括未来的我自己）看的，不是免责声明。
 
@@ -241,6 +244,9 @@ usage.completion_tokens; do NOT count chunks.
 - 与一次真实 vLLM 启动日志的三方对账（30.53 GiB / 147,456 B / 222,336 tokens）；
 - 块池的分配、释放、前缀复用、COW、守恒不变量（含注入违规的反证）；
 - 连续批处理调度的 token 预算分配、chunked prefill、到达时刻判定；
+- 逐 token KV 块记账 + 内存压力抢占/重算（对齐 vLLM v1 `scheduler.py` RECOMPUTE 语义）；
+- C++17 与 Python 双实现逐操作对拍（6 个种子随机脚本逐行一致，含 LIFO/FIFO/COW/守恒定向用例）；
+- 可选真实 tokenizer 适配层（优先 `tokenizers` Rust，退回 `transformers`，装缺报错带安装提示）；
 - SSE 流式的 TTFT / TPOT / 吞吐解析，含一 chunk 多 token 的识别；
 - 容量规划决定块池大小和调度并发上限；按调度起止步回放分配/释放，结束 used=0；
   schedsim → 合成 SSE → bench 的时序还原误差 < 1e-9。
@@ -257,13 +263,34 @@ usage.completion_tokens; do NOT count chunks.
   （后者是整个进程的显存占比，还要减去权重和激活）；
 - `int4` 的字节数只算理想 payload，不含 scale/zero-point 元数据与对齐填充
   （`IDEAL_PAYLOAD_ONLY` 已标出这一点）；
-- 没有接入真实 tokenizer，`bench` 在无 usage 的流上需要调用方自己传 `token_counter`。
+- 真实 tokenizer 只在**本机**验证过（`tokenizers`/`transformers` 本地缓存离线加载），
+  尚未在云端真实引擎上验证分词计数与 usage 的一致性；
+- `schedsim` 的抢占/重算语义对齐 vLLM v1 `scheduler.py` 的 RECOMPUTE 路径，但未与
+  真实引擎的调度器逐位对拍（本地无 GPU 跑不了引擎）。
 
 **下一步要做的**（真实引擎验证需云端 GPU）：
 
 - 在真实 vLLM / SGLang 上跑 `bench`，把 TTFT/TPOT 与引擎自带 `vllm bench serve` 对齐；
 - 用 `schedsim` 拟合真实引擎的调度行为，检验时间模型的偏差是否在 10% 以内；
-- 对照已有的 `aidless/paged-kv` C++ 实现，增加逐操作对拍。
+- 用真实引擎验证 `HFTokenCounter` 的分词计数与 `usage.completion_tokens` 的一致性；
+- 复验三方对账锚点：真实引擎启动日志的 Available KV / KV cache size 与 `kvcalc` 的
+  公式结果再次交叉核对（本次为一次日志样本，扩大样本可提高置信）。
+
+### 与已有仓库的关系
+
+同主题的 5 个仓库已覆盖大部分方向，本仓库是「把四件事串成一条 CPU 闭环的学习实验室」，
+与它们互补（交叉阅读 + 填补空白），不是重复发明：
+
+| 已有仓库 | 方向 | 本仓库的差异化 |
+|---|---|---|
+| `aidless/paged-kv` | 块池的 C++17 实现 | 本仓库是 Python 展示 + C++ 对拍（交叉验证） |
+| `aidless/roofline-lint` | 显存估算（带 selftest/prove-red） | 本仓库增三方对账校准 |
+| `aidless/ttftkit` | 完整端点压测 + fail-closed 门禁 | 本仓库是确定性时序 + 本地 mock 口径演示 |
+| `aidless/kv-block-mass` | kernel 侧延伸（Triton） | 本仓库不碰 kernel |
+| `aidless/accel-preflight` | 云端算力预检 | 本仓库是纯 CPU 学习实验 |
+
+`schedsim`（连续批处理调度模拟）在本账号是**真空白**——按「continuous batching」检索
+现有公开仓库，命中数为 0。本仓库填补了这个缺口。
 
 ---
 
@@ -278,7 +305,7 @@ kv_serve_lab/
   bench/        # SSE 解析 + 指标聚合
     client.py       # 真实 HTTP 流式客户端
     mock_server.py  # 可控的 SSE mock 服务端
-tests/          # 180 项，全部 CPU 可跑
+tests/          # 231 项，全部 CPU 可跑（含 C++ 对拍，需 g++/make）
 examples/demo.py
 docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ```
@@ -286,8 +313,9 @@ docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ## 测试
 
 ```bash
-python3 -m pytest                              # 180 passed
+python3 -m pytest                              # 231 passed
 python3 -m pytest tests/test_calibration.py -q  # 只看与真实引擎对账的那 11 项
+python3 -m pytest tests/test_cpp_differential.py -q  # 只看 C++/Python 对拍那 10 项
 ```
 
 学习顺序和源码入口见 [GitHub 学习地图](docs/GITHUB-MAP.md)。

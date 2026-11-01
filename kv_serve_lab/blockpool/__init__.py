@@ -8,14 +8,14 @@
   :202 get_cached_block(hash)      前缀命中
   :230 cache_full_blocks           登记 hash→block
 
-关于「一个 hash 对应几个块」——**本库的 hash→block 单值映射是刻意的简化，
-不是说 vLLM 不做去重**：
+关于「一个 hash 对应几个块」——本库的 hash→block 单值映射是刻意的简化：
 - vLLM 的 ``BlockHashToBlockMap``（block_pool.py:36）允许一个 hash 影射到一个
-  或多个 block（不同大小/分组），并且**相同内容的块共享同一个 canonical block**，
-  这本身就是前缀去重（dedup）。
+  或多个 block（不同分组），但它的 docstring 里 ``NOTE #1`` 写明
+  **"We currently don't de-duplicate the blocks in the cache"**，理由是
+  要保证已分配的 block id 不变、block table 可以 append-only。
+  所以「相同内容出现两块」在 vLLM 里是合法状态，不是 bug。
 - 本库把它简化成「一个 hash 只记一个 block id」，是为了在 CPU 上讲清
-  「命中 / 引用计数 / LRU / 逐出」的机制，而不是复刻 vLLM 的多块映射与去重策略。
-  简化的是数据结构，不是「vLLM 不去重」。
+  「命中 / 引用计数 / LRU / 逐出」的机制，而不是复刻 vLLM 的多块映射。
 
 与 vLLM 的差异（本库刻意简化，写在明处）：
 - vLLM 的 free 队列是「双端队列 + 中间插 hash 块」，这里用 OrderedDict 表达同一语义

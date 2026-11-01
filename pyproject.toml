@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kv-serve-lab"
+version = "0.1.0"
+description = "CPU-friendly teaching toolkit for LLM inference serving: KV-cache capacity math, PagedAttention-style block pool, continuous-batching scheduler simulation, and streaming benchmark client."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "aidless" }]
+keywords = ["llm", "inference", "serving", "kv-cache", "paged-attention", "continuous-batching", "vllm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []  # 运行时纯标准库
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/aidless/kv-serve-lab"
+
+[tool.setuptools.packages.find]
+include = ["kv_serve_lab*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

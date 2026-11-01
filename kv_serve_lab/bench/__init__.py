@@ -4,14 +4,14 @@
 
     TPOT = (latency - ttft) / (output_len - 1)
 
-其中 latency 是「请求发出 -> 最后一个 token」、ttft 是「请求发出 -> 第一个 token」，
+其中 latency 是「请求发出 -> 流结束」、ttft 是「请求发出 -> 第一个 token」，
 output_len 是该请求**实际产出 token 数**。
 
 **为什么 chunk ≠ token（本项目反复强调）**：
     OpenAI 兼容接口的 SSE 流，一个 chunk 可能一次带多个 token（服务端为了省网络
     往返会打包）。若用「收到几个 chunk」当 output_len，会系统性低估输出长度、
     把 TPOT 算大。因此 output_len 只能来自：
-      (a) 每个 chunk 的文本经 tokenizer 计数后累加；或
+      (a) 拼接完整输出文本后经 tokenizer 计数；或
       (b) 服务端 usage.completion_tokens（累积值，取最后一次）。
     两者都没有时**必须报错**，不许悄悄退化成数 chunk。
 
@@ -64,6 +64,8 @@ class RequestTrace:
     # 流真正结束的时刻（含末尾 usage chunk / [DONE]）。vLLM bench 的 latency
     # 量的是整条流结束，不是最后一个 token 到达 —— 二者在 usage-only 收尾时不同。
     stream_end_sec: float | None = None
+    text_chunk_times: list[float] | None = None
+    text_token_total: int | None = None
 
     def _token_arrivals(self) -> list[TokenArrival]:
         return [a for a in self.arrivals if a.n_tokens > 0]
@@ -72,11 +74,15 @@ class RequestTrace:
     def output_len(self) -> int:
         if self.usage_total is not None:
             return self.usage_total
+        if self.text_token_total is not None:
+            return self.text_token_total
         return sum(a.n_tokens for a in self.arrivals)
 
     @property
     def chunk_count(self) -> int:
         """真正携带 token 的 chunk 数（不含 role-only / 空 chunk）。"""
+        if self.text_chunk_times is not None:
+            return len(self.text_chunk_times)
         return len(self._token_arrivals())
 
     @property
@@ -86,6 +92,8 @@ class RequestTrace:
 
     @property
     def first_token_sec(self) -> float:
+        if self.text_chunk_times:
+            return self.text_chunk_times[0]
         ta = self._token_arrivals()
         if not ta:
             raise BenchError(f"{self.req_id}: stream produced no tokens")
@@ -94,9 +102,12 @@ class RequestTrace:
     @property
     def end_sec(self) -> float:
         ta = self._token_arrivals()
-        if not ta:
+        if self.text_chunk_times:
+            last_token = self.text_chunk_times[-1]
+        elif ta:
+            last_token = ta[-1].t_sec
+        else:
             raise BenchError(f"{self.req_id}: stream produced no tokens")
-        last_token = ta[-1].t_sec
         if self.stream_end_sec is not None:
             return max(last_token, self.stream_end_sec)
         return last_token
@@ -164,82 +175,54 @@ def trace_from_payloads(
     timed_payloads,
     token_counter=None,
 ) -> RequestTrace:
-    """从 (t_sec, payload) 序列构造 RequestTrace。
+    """解析单输出文本流，保留正文时序，结束后优先使用服务端 usage 总数。
 
-    计数规则（**usage 是总量口径，文本是时序口径**）：
-
-    1. **时序只由文本 chunk 提供**。TTFT 落在第一个真正带 token 的 chunk 上，
-       绝不能被末尾那个 usage-only chunk 拉走 —— 否则会把「首 token 延迟」
-       错量成「整条流结束」。
-    2. **数量以 usage 为准**。`usage.completion_tokens` 是累积总数；若它比已计入的
-       多，差额的处理取决于**上一个 arrival 的来源**：
-         - 上一个 arrival 来自文本 chunk → 差额**并入**它（不新建），因为收尾 usage
-           只是把文本估计修正到服务端的真实计数，不是一次新的投递。
-         - 上一个 arrival 来自 usage（即整条流没有文本，只报 usage）→ 差额**新建**
-           一个 arrival，因为那个 usage chunk 本身就是一次真实的投递时刻。
-       例：5 个文本 chunk 各 1 + 末尾 usage=5 → 5 个 token、5 个 chunk，不是 10。
-    3. 文本 chunk 但没给 token_counter、且流里**从未**出现 usage 时抛 BenchError：
-       数 chunk 不等于数 token。
-    4. `latency` 量到**流结束**（末尾 usage chunk 或 [DONE] 的时刻），与 vLLM
-       `benchmarks/serve.py` 的 `latency - ttft` 口径一致；当流以 usage-only chunk
-       收尾时，这个时刻晚于最后一个 token。
-
-    token_counter: callable(text:str)->int。
+    无 usage 时，对拼接后的完整正文调用 token_counter，避免跨 chunk 分词不满足
+    可加性。正文 chunk 的时刻与 token 总数独立保存，usage-only 收尾不改变 TTFT。
+    纯 usage 时间线仅用于合成测试，不能据此推断真实模型的首 token 时刻。
+    latency 取最后 payload 或 [DONE] 的时刻。
     """
     arrivals: list[TokenArrival] = []
+    text_times: list[float] = []
+    text_parts: list[str] = []
     usage_total: int | None = None
-    accounted = 0
-    saw_usage = False
-    last_arrival_from_text = False
     stream_end_sec: float | None = None
-
     for t_sec, payload in timed_payloads:
+        stream_end_sec = t_sec
         if payload == "[DONE]":
-            stream_end_sec = t_sec
             break
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
-
-        stream_end_sec = t_sec  # 任何真实 payload 都推进流结束时刻
-
-        usage = obj.get("usage") or {}
         text = _extract_text(obj)
-        cum = _usage_cumulative(usage)
-
-        # --- 文本：只提供时序，数量先按 token_counter 估 ---
         if text:
-            if token_counter is None and cum is None and not saw_usage:
-                raise BenchError(
-                    f"{req_id}: chunk carries text but token_counter is None. "
-                    "chunk count != token count — pass a tokenizer or have the "
-                    "server send usage.completion_tokens; do NOT count chunks."
-                )
-            if not saw_usage and token_counter is not None:
-                n = token_counter(text)
-                if n > 0:
-                    arrivals.append(TokenArrival(t_sec, n))
-                    accounted += n
-                    last_arrival_from_text = True
-
-        # --- usage：累积总数，差额并入最后一个 token arrival ---
+            text_times.append(t_sec)
+            text_parts.append(text)
+        cum = _usage_cumulative(obj.get("usage") or {})
         if cum is not None:
-            saw_usage = True
+            if cum < 0 or (usage_total is not None and cum < usage_total):
+                raise BenchError(f"{req_id}: usage count must be nonnegative and monotonic")
+            delta = cum - (usage_total or 0)
+            if delta > 0:
+                arrivals.append(TokenArrival(t_sec, delta))
             usage_total = cum
-            if cum > accounted:
-                delta = cum - accounted
-                if arrivals and last_arrival_from_text:
-                    # 收尾 usage 只是把文本估计修正到服务端真值，并入同一个 arrival
-                    last = arrivals[-1]
-                    arrivals[-1] = TokenArrival(last.t_sec, last.n_tokens + delta)
-                else:
-                    # 纯 usage 流：这个 usage chunk 自己就是一次真实投递时刻
-                    arrivals.append(TokenArrival(t_sec, delta))
-                    last_arrival_from_text = False
-                accounted = cum
 
-    return RequestTrace(req_id, start_sec, arrivals, usage_total, stream_end_sec)
+    text_total = None
+    if text_parts and usage_total is None:
+        if token_counter is None:
+            raise BenchError(
+                f"{req_id}: chunk carries text but token_counter is None. "
+                "chunk count != token count — pass a tokenizer or have the "
+                "server send usage.completion_tokens; do NOT count chunks."
+            )
+        text_total = token_counter("".join(text_parts))
+        if not isinstance(text_total, int) or isinstance(text_total, bool) or text_total < 0:
+            raise BenchError(f"{req_id}: token_counter must return a nonnegative integer")
+    return RequestTrace(
+        req_id, start_sec, arrivals, usage_total, stream_end_sec,
+        text_times if text_times else None, text_total,
+    )
 
 
 def _usage_cumulative(usage: dict) -> int | None:

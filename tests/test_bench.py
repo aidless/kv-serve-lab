@@ -36,8 +36,8 @@ class TestSingleChunkOneToken:
         TPOT = (0.54 - 0.50) / (5 - 1) = 0.01
         """
         start = 0.5
-        payloads = [(1.00, '{"choices":[{"text":"a"}]}')]
-        payloads += [(1.01 + i * 0.01, '{"choices":[{"text":"a"}]}') for i in range(4)]
+        payloads = [(1.00, '{"choices":[{"text":"a "}]}')]
+        payloads += [(1.01 + i * 0.01, '{"choices":[{"text":"a "}]}') for i in range(4)]
         tr = trace_from_payloads("r", start, payloads, token_counter=word_counter)
         assert tr.output_len == 5
         assert tr.chunk_count == 5
@@ -55,7 +55,7 @@ class TestChunkBundling:
         output_len=3；TPOT=(latency-ttft)/(3-1)。
         """
         payloads = [
-            (1.00, '{"choices":[{"text":"aa bb"}]}'),
+            (1.00, '{"choices":[{"text":"aa bb "}]}'),
             (1.03, '{"choices":[{"text":"cc"}]}'),
         ]
         tr = trace_from_payloads("r", 0.0, payloads, token_counter=word_counter)
@@ -104,7 +104,7 @@ class TestUsageAccounting:
 
 class TestTpotEdge:
     def test_single_token_has_no_tpot(self):
-        payloads = [(1.00, '{"choices":[{"text":"a"}]}')]
+        payloads = [(1.00, '{"choices":[{"text":"a "}]}')]
         tr = trace_from_payloads("r", 0.0, payloads, token_counter=word_counter)
         assert tr.output_len == 1
         assert math.isnan(tr.tpot_sec)
@@ -113,7 +113,7 @@ class TestTpotEdge:
 class TestSseParsing:
     def test_done_sentinel_stops(self):
         lines = [
-            'data: {"choices":[{"text":"a"}]}',
+            'data: {"choices":[{"text":"a "}]}',
             "",
             "data: [DONE]",
             'data: {"choices":[{"text":"SHOULD_NOT_APPEAR"}]}',
@@ -186,6 +186,37 @@ class TestMedianCaliber:
         assert s.median_ttft_sec == pytest.approx(0.3)
 
 
+class TestStreamAccountingBoundaries:
+    def test_terminal_usage_needs_no_tokenizer(self):
+        tr = trace_from_payloads("r", 0.0, [
+            (1.0, '{"choices":[{"text":"hel"}]}'),
+            (1.1, '{"choices":[{"text":"lo"}]}'),
+            (1.2, '{"usage":{"completion_tokens":1}}'),
+        ])
+        assert tr.output_len == 1
+        assert tr.chunk_count == 2
+        assert tr.ttft_sec == 1.0
+        assert tr.latency_sec == 1.2
+
+    def test_text_timing_continues_after_early_usage(self):
+        tr = trace_from_payloads("r", 0.0, [
+            (1.0, '{"choices":[{"text":"a "}],"usage":{"completion_tokens":1}}'),
+            (1.1, '{"choices":[{"text":"b"}],"usage":{"completion_tokens":2}}'),
+        ])
+        assert tr.chunk_count == 2
+        assert tr.first_token_sec == 1.0
+        assert tr.output_len == 2
+
+    def test_tokenizer_sees_concatenated_text(self):
+        # 分词不满足可加性：'hel'/'lo' 各一个 token，'hello' 合起来仍只有一个。
+        tr = trace_from_payloads("r", 0.0, [
+            (1.0, '{"choices":[{"text":"hel"}]}'),
+            (1.1, '{"choices":[{"text":"lo"}]}'),
+        ], token_counter=lambda text: len(text.split()))
+        assert tr.output_len == 1
+        assert tr.chunk_count == 2
+
+
 class TestUsageInFinalChunkOnly:
     """OpenAI 兼容流的常见形状：正文 chunk 里只有文本，**最后一个** chunk 才带 usage。
 
@@ -201,11 +232,11 @@ class TestUsageInFinalChunkOnly:
         错误（旧实现）：文本计 5 + usage 增量 5 = 10，TTFT 变成最后一块的时刻。
         """
         payloads = [
-            (1.00, '{"choices":[{"text":"a"}]}'),
-            (1.01, '{"choices":[{"text":"a"}]}'),
-            (1.02, '{"choices":[{"text":"a"}]}'),
-            (1.03, '{"choices":[{"text":"a"}]}'),
-            (1.04, '{"choices":[{"text":"a"}]}'),
+            (1.00, '{"choices":[{"text":"a "}]}'),
+            (1.01, '{"choices":[{"text":"a "}]}'),
+            (1.02, '{"choices":[{"text":"a "}]}'),
+            (1.03, '{"choices":[{"text":"a "}]}'),
+            (1.04, '{"choices":[{"text":"a "}]}'),
             (1.05, '{"choices":[],"usage":{"completion_tokens":5}}'),
         ]
         tr = trace_from_payloads("r", 0.5, payloads, token_counter=word_counter)
@@ -220,7 +251,7 @@ class TestUsageInFinalChunkOnly:
         时序仍来自文本 chunk（那才是 token 真正到达的时刻）。
         """
         payloads = [
-            (1.00, '{"choices":[{"text":"aa bb"}]}'),   # 2
+            (1.00, '{"choices":[{"text":"aa bb "}]}'),   # 2
             (1.02, '{"choices":[{"text":"cc dd"}]}'),   # 2
             (1.04, '{"choices":[],"usage":{"completion_tokens":5}}'),
         ]

@@ -162,6 +162,15 @@ class BlockPool:
                     f"conservation violated: in_use block {bid} has "
                     f"ref_count={blk.ref_count}"
                 )
+        # hash 索引是叠加弱引用层：索引指向的块必须真的持有那条 hash。
+        # 反向不成立：同一 hash 被更晚的块覆盖后，旧块仍留着自己的 block_hash
+        # （vLLM 也一样），那种「被取代」状态是合法的。
+        for h, owner in self._hash_to_block.items():
+            if self._blocks[owner].block_hash != h:
+                raise BlockPoolError(
+                    f"conservation violated: hash {h!r} points to block "
+                    f"{owner} which holds {self._blocks[owner].block_hash!r}"
+                )
 
     @property
     def total_expected(self) -> int:
@@ -399,12 +408,12 @@ class BlockPool:
     # ---- copy-on-write ----
 
     def copy_on_write(self, block_id: int) -> int:
-        """共享块要写时复制一份新块。单引用时是 no-op（不需要复制）。
+        """共享或已登记前缀的块要写时复制一份。独占且未登记时无需复制。
 
         语义（vLLM v1 block_pool.py:812 ``is_block_writable`` 的思路）：
 
         - 空闲块（ref_count == 0）：没有「写者」可复制，直接报错；
-        - 独占块（ref_count == 1）：无需复制，返回原块 id；
+        - 独占且无 hash：返回原块 id；独占且有 hash：复制，原块退回缓存队列；
         - 共享块（ref_count > 1）：分配新块，把 token payload **真正复制**过去，
           新块 ref_count=1 且**不登记 hash**（它准备被写入，内容会与旧前缀分叉）；
           原块 ref_count 减一、**保留自己的前缀 hash** 与内容不变。
@@ -416,10 +425,11 @@ class BlockPool:
             raise BlockPoolError(
                 f"cannot copy_on_write free block {block_id} (ref_count=0)"
             )
-        if blk.ref_count == 1:
-            return block_id  # 独占，直接写
+        if blk.ref_count == 1 and blk.block_hash is None:
+            return block_id  # 独占且未登记前缀，直接写
+        # 独占但已登记前缀：内容作为前缀不可变，也必须复制出可写副本
 
-        # 共享：先分配新块（失败会先抛错，此时尚未改动原块）
+        # 先分配新块（失败会先抛错，此时尚未改动原块）
         new_id = self.allocate(1)[0]
         new_blk = self._blocks[new_id]
         # 复制真实 token payload（list 拷贝，两个块互不影响）
@@ -427,7 +437,14 @@ class BlockPool:
         new_blk.ref_count = 1
         # 新块**不继承 hash**：它是可写的分叉副本，不是同一前缀
         new_blk.block_hash = None
-        # 原块引用转出一个给新块；原块保留 hash 与 payload
-        blk.ref_count -= 1
+        if blk.ref_count > 1:
+            # 共享：原块少一个引用，保留 hash 与 payload，其他持有者不受影响
+            blk.ref_count -= 1
+        else:
+            # 独占但带前缀：原块引用整体转给新块，自己变成空闲的缓存块
+            blk.ref_count = 0
+            self._in_use.pop(block_id, None)
+            self._free[block_id] = None
+            self._free.move_to_end(block_id, last=True)  # 带 hash -> FIFO 队尾
         self._check_conservation()
         return new_id

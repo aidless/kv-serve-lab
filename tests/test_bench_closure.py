@@ -26,7 +26,7 @@ def _synthesize_payloads(start_sec, ttft_sec, tpot_sec, output_len, word="w"):
     payloads = []
     for i in range(output_len):
         t = start_sec + ttft_sec + i * tpot_sec
-        payloads.append((t, '{"choices":[{"text":"%s"}]}' % word))
+        payloads.append((t, '{"choices":[{"text":"%s "}]}' % word))
     return payloads
 
 
@@ -65,7 +65,23 @@ class TestSchedsimBenchClosure:
         assert summary.total_output_tokens == 6 + 4 + 10
 
 
+@pytest.mark.parametrize('width', [0, -1, 1.5, True])
+def test_mock_rejects_invalid_chunk_width_before_loop(width):
+    # num_tokens=0 避免旧实现的无限循环；校验顺序先报 chunk width。
+    with pytest.raises(ValueError, match='tokens_per_chunk'):
+        chunked_plan(num_tokens=0, ttft_sec=0, tpot_sec=0, tokens_per_chunk=width)
+
+
 class TestMockServerIntegration:
+    def test_client_traces_keep_a_shared_clock(self):
+        with SSEMockServer(lambda body: per_token_plan(
+                num_tokens=2, ttft_sec=0.0, tpot_sec=0.001)) as srv:
+            first = stream_request(srv.url, 'a', token_counter=word_counter)
+            second = stream_request(srv.url, 'b', token_counter=word_counter)
+        assert second.start_sec >= first.end_sec
+        summary = summarize([first, second])
+        assert summary.wall_sec >= first.latency_sec + second.latency_sec
+
     def test_one_chunk_one_token(self):
         with SSEMockServer(lambda body: per_token_plan(
                 num_tokens=5, ttft_sec=0.0, tpot_sec=0.001)) as srv:

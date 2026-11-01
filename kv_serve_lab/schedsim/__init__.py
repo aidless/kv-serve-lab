@@ -45,6 +45,10 @@ class Request:
     output_tokens: int
 
     def __post_init__(self) -> None:
+        for name in ("prompt_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{self.req_id}: {name} must be an integer")
         if self.prompt_tokens < 1:
             raise ValueError(f"{self.req_id}: prompt_tokens must be >= 1")
         if self.output_tokens < 1:
@@ -63,13 +67,18 @@ class SimConfig:
     t_decode_token: float = 0.0      # 每个 decode 请求每步的边际成本
 
     def __post_init__(self) -> None:
-        if self.max_num_batched_tokens < 1:
-            raise ValueError("max_num_batched_tokens must be >= 1")
-        if self.max_num_seqs < 1:
-            raise ValueError("max_num_seqs must be >= 1")
+        for name in ("max_num_batched_tokens", "max_num_seqs"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{name} must be >= 1")
         for name in ("step_sec", "step_overhead", "t_prefill_token", "t_decode_token"):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} must be >= 0")
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
+        cost_model = any((self.step_overhead, self.t_prefill_token, self.t_decode_token))
+        if cost_model and self.step_overhead <= 0:
+            raise ValueError("cost model needs positive step_overhead for every step")
         if self.step_sec <= 0 and self.step_overhead <= 0:
             raise ValueError(
                 "need a positive time source: step_sec (constant-step model) "
@@ -149,6 +158,7 @@ class SimResult:
     step_output_tokens: list[int] = field(default_factory=list)
     step_in_flight: list[int] = field(default_factory=list)
     step_durations: list[float] = field(default_factory=list)
+    step_system_areas: list[float] = field(default_factory=list)
     _output_lens: dict[str, int] = field(default_factory=dict)
 
     def per_request_tpot(self, req_id: str) -> float:
@@ -184,7 +194,7 @@ class SimResult:
         for out, fl, dur in zip(
             self.step_output_tokens, self.step_in_flight, self.step_durations
         ):
-            if fl >= self.max_num_seqs and out > 0:
+            if fl >= self.max_num_seqs:
                 sat_out += out
                 sat_time += dur
         if sat_time <= 0:
@@ -257,6 +267,7 @@ class Simulator:
         step_in_flight: list[int] = []
         step_durations: list[float] = []
         pending_pos = 0
+        step_system_areas: list[float] = []
 
         while True:
             # 到达判定按**墙钟**比较，不能按步号换算：成本模型下每步耗时随负载变化，
@@ -325,12 +336,20 @@ class Simulator:
                 step_output_tokens.append(0)
                 step_in_flight.append(0)
                 step_durations.append(gap)
+                step_system_areas.append(0.0)
                 continue
 
             # 3) 计算本步耗时并推进时钟
             dur = self.config.step_time(prefill_tokens_this_step, decode_reqs_this_step)
+            step_start = now
             now += dur
             step_end = now
+            # 独立测量系统人口积分：包括等待与运行请求，以及本步中途到达的请求。
+            # 完成仅在步末发生；已完成请求不参与本步。这里不读取事后 latency。
+            step_system_areas.append(sum(
+                max(0.0, step_end - max(step_start, st.arrival_sec))
+                for st in states if not st.finished and st.arrival_sec < step_end
+            ))
             in_flight = len(running)
             step_input_tokens.append(sum(granted.values()))
             step_in_flight.append(in_flight)
@@ -384,19 +403,19 @@ class Simulator:
             )
 
         total_output = sum(r.output_tokens for r in requests)
-        sum_latency = sum(s.latency_sec for s in stats.values())
         return SimResult(
             requests=stats,
             total_tokens_computed=total_tokens,
             total_sec=now,
             output_throughput=(total_output / now) if now > 0 else 0.0,
-            mean_system_requests=(sum_latency / now) if now > 0 else 0.0,
+            mean_system_requests=(sum(step_system_areas) / now) if now > 0 else 0.0,
             arrival_rate=(len(requests) / now) if now > 0 else 0.0,
             max_num_seqs=self.config.max_num_seqs,
             step_input_tokens=step_input_tokens,
             step_output_tokens=step_output_tokens,
             step_in_flight=step_in_flight,
             step_durations=step_durations,
+            step_system_areas=step_system_areas,
             _output_lens={r.req_id: r.output_tokens for r in requests},
         )
 

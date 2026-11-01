@@ -26,6 +26,9 @@ def chunked_plan(*, num_tokens, ttft_sec, tpot_sec, tokens_per_chunk=1, word="to
     首 token 出现在 ttft_sec；之后每隔 tpot_sec 再出一批。一批 tokens_per_chunk 个。
     chunk 文本用空格分隔的词表示 token，好让 word_counter 正确计数。
     """
+    if (not isinstance(tokens_per_chunk, int) or isinstance(tokens_per_chunk, bool)
+            or tokens_per_chunk < 1):
+        raise ValueError("tokens_per_chunk must be a positive integer")
     if num_tokens < 1:
         raise ValueError("num_tokens must be >= 1")
     plan: list[tuple[float, dict]] = []
@@ -33,7 +36,7 @@ def chunked_plan(*, num_tokens, ttft_sec, tpot_sec, tokens_per_chunk=1, word="to
     delay = ttft_sec
     while emitted < num_tokens:
         k = min(tokens_per_chunk, num_tokens - emitted)
-        text = " ".join([word] * k)
+        text = " ".join([word] * k) + " "
         plan.append((delay, {"choices": [{"text": text}]}))
         emitted += k
         delay = tpot_sec

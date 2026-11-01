@@ -3,11 +3,10 @@
 四个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事
 串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
 
-纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 138 项全部通过。
+纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 180 项全部通过。
 
-> **这不是推理引擎，也不是压测工具。** 它不实现 Attention kernel、不 fork vLLM、不产真实
-> GPU 性能数字。它的用途是：把推理服务里那些**只在生产事故里才会暴露的口径问题**，提前
-> 做成能在本地一秒内复现的测试。见 [能力边界](#能力边界)。
+> 一个用于学习推理服务的 CPU 实验仓库，覆盖显存估算、块生命周期、调度模拟和流式度量。
+> 示例输出包含确定性模拟和本地 HTTP mock；真实 GPU 性能验证尚未完成。见 [能力边界](#能力边界)。
 
 ---
 
@@ -27,7 +26,10 @@
 ```bash
 git clone https://github.com/aidless/kv-serve-lab.git
 cd kv-serve-lab
-python3 -m pytest          # 138 passed
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python3 -m pytest          # 180 passed
 python3 examples/demo.py   # 四模块闭环，全程无 GPU
 ```
 
@@ -50,14 +52,17 @@ Part 2  blockpool — 块池 / 前缀命中 / COW
   前缀命中 block=0，acquire 后该块 ref=2（两请求共享）
   COW：原块 0 ref 降为 1 且保留前缀；新块 2 独占可写，payload=(99, 98, 97, 96)
   audit: BlockAudit(total=8, used=3, free=5, cached=0)
+  释放所有请求引用后: BlockAudit(total=8, used=0, free=8, cached=1)
 
 ======================================================================
 Part 3  schedsim — 连续批处理调度预测
 ======================================================================
-配置：budget=256, max_num_seqs=4, step=0.01s；8 请求,prompt16/output32
-  mean TTFT = 0.1300s, p99 = 0.2500s
-  mean latency = 0.4400s
-  饱和稳态吞吐 = 400.0 tok/s（解析上界 max_num_seqs/step = 400）
+  容量驱动: max_num_seqs=87, pool_blocks=22272
+  生命周期回放: peak_blocks=2048, final=BlockAudit(total=22272, used=0, free=22272, cached=0)
+配置：budget=256, max_num_seqs=87, step=0.01s；8 请求,prompt16/output32
+  mean TTFT = 0.0100s, p99 = 0.0100s
+  mean latency = 0.3200s
+  满载窗口吞吐（未满载则为整段）= 800.0 tok/s（解析上界 max_num_seqs/step = 8700）
 
 ======================================================================
 Part 4  bench — 预测回放成 SSE，再『实测』回来（闭环）
@@ -66,12 +71,13 @@ Part 4  bench — 预测回放成 SSE，再『实测』回来（闭环）
    req   pred_ttft  meas_ttft   pred_tpot  meas_tpot
     r0      0.0100     0.0100      0.0100     0.0100
     r3      0.0100     0.0100      0.0100     0.0100
-    r7      0.2500     0.2500      0.0100     0.0100
+    r7      0.0100     0.0100      0.0100     0.0100
   合计 3 请求 / 96 token，TTFT/TPOT 完全一致（相对误差 < 1e-9）
 
 [4b] 真实 HTTP 流式（mock 服务端，含毫秒级网络开销）：
-  实测 TTFT=<每次运行不同，约 20-80ms>（含 HTTP 往返；理论 ≥20ms）
-  实测 TPOT=<每次运行不同，约 5.3ms>，output_len=8，chunk_count=8
+  实测 TTFT=<每次运行不同，含 HTTP 与 mock 延迟>
+  实测 TPOT=<每次运行不同>，output_len=8，chunk_count=8
+
 ```
 
 Part 4a 是**闭环的关键**：`schedsim` 预测出的 TTFT/TPOT 被合成成 SSE 时间线，再喂给
@@ -101,6 +107,11 @@ bytes_per_token = (kv_lora_rank + qk_rope_head_dim) × n_layers × dtype_bytes
 如果按 GQA 公式算，会得到 `2×27×16×128×2 = 221,184 B`，**差 7.1 倍**。
 
 五个基准模型（数字全部来自各自真实的 `config.json`，fp16）：
+
+配置快照、下载地址/时间和 SHA-256 见 [证据清单](evidence/manifest.json)。
+历史启动日志摘录见 [校准日志](evidence/vllm-calibration-excerpt.log)，引擎为
+`v0.16.1.dev0+g89a77b108.d20260317`，bf16、TP=1、Qwen3-4B 微调检查点。
+原日志未记录 GPU 型号，不能据此推断硬件；这次提交未重跑该 GPU 实验。
 
 | 模型 | 层数 | kv heads | head_dim | B/token | 来源 |
 |---|---|---|---|---|---|
@@ -185,29 +196,24 @@ OpenAI 兼容接口的 SSE 流里，一个 chunk 可能一次带多个 token（�
 所以 `output_len` 只能来自两个地方，按优先级：
 
 1. 服务端 `usage.completion_tokens`（累积值，取最后一次）—— **权威**，即使同 chunk 带文本也不覆盖；
-2. 没有 usage 时，把每个 chunk 的文本过 tokenizer 累加。
+2. 没有 usage 时，对拼接后的完整输出文本调用 tokenizer。
 
-### bench：收尾 usage chunk 不改变 TTFT
+### bench：计数与正文时序分别记录
 
-`stream_options.include_usage=True` 是最常见的流形状：**正文 chunk 只有文本，最后一个
-chunk 才带 usage**。这里有两个独立的量，混了都会错：
+`stream_options.include_usage=True` 的常见形状是正文 chunk 只有文本，末尾才带 usage。
+解析器完整读流后取服务端累计总数，TTFT 保留在第一个有正文的 chunk 上。
+后续文本即使出现在 usage 之后，也继续记录其到达时刻。
 
-- **时序只由文本 chunk 提供**。TTFT 落在第一个带 token 的 chunk 上；若让末尾的
-  usage-only chunk 参与，TTFT 会被错量成整条流的结束时刻。
-- **latency 量到流结束**（末尾 usage chunk 或 `[DONE]` 的时刻），与 vLLM
-  `benchmarks/serve.py` 的 `(latency - ttft) / (output_len - 1)` 口径一致。因此当流以
-  usage-only chunk 收尾时，`latency` 晚于最后一个 token 的时刻——这是刻意的，不是 bug。
+没有 usage 时，调用方提供 `token_counter(text)`，解析器对**拼接后的完整文本**调用一次。
+分词不满足可加性，分别分词 `hel` 和 `lo` 再相加可能比对 `hello` 分词多一个 token。
+这种重分词计数仍可能与服务端生成 token IDs 不同，应优先使用服务端 usage。
 
-usage 差额如何归并，取决于上一个 arrival 的来源：
+正文 chunk 数与 token 总数独立记录；一个 chunk 可带多 token，一个 token 也可能经过多个
+文本片段送达。本工具不从 chunk 间隔推断逐 token ITL。纯 usage 时间线只用于合成测试，
+无法据此核实真实模型的首 token 时刻。
 
-| 流的形状 | 差额处理 | 理由 |
-|---|---|---|
-| 文本 chunk + 收尾 usage | 并入最后一个文本 arrival | usage 只是把文本估计修正到真值，不是新投递 |
-| 只有 usage chunk（无文本） | 新建 arrival | 那个 usage chunk 本身就是一次真实投递时刻 |
-
-对应的回归测试在 `tests/test_bench.py::TestUsageInFinalChunkOnly`：
-5 个文本 chunk 各 1 token + 末尾 usage=5 → `output_len == 5`（不是 10）、
-`ttft_sec == 0.50`（不是 0.55）、`latency_sec == 0.55`。
+`latency` 记录到最后 payload 或 `[DONE]` 的时刻。因此末尾 usage 可能使它晚于正文结束。
+TPOT 仍按 `(latency - ttft) / (output_len - 1)` 计算；与外部工具比较时需要同时核对结束点。
 
 两者都没有时**直接抛错**，不许悄悄退化成数 chunk：
 
@@ -224,6 +230,9 @@ usage.completion_tokens; do NOT count chunks.
 
 ## 能力边界
 
+集成层使用保守的整请求 KV 预留，事后回放块生命周期；尚未实现逐 token 块增长、
+内存压力抢占或块不足时的调度反馈。Little’s law 的人口积分在每步独立记录，包含排队请求。
+
 这份清单是给读 README 的人（包括未来的我自己）看的，不是免责声明。
 
 **做到了**（每一条都有测试守着，`python3 -m pytest` 可复现）：
@@ -233,13 +242,14 @@ usage.completion_tokens; do NOT count chunks.
 - 块池的分配、释放、前缀复用、COW、守恒不变量（含注入违规的反证）；
 - 连续批处理调度的 token 预算分配、chunked prefill、到达时刻判定；
 - SSE 流式的 TTFT / TPOT / 吞吐解析，含一 chunk 多 token 的识别；
-- 四模块闭环：schedsim 预测 → 合成 SSE → bench 还原，相对误差 < 1e-9。
+- 容量规划决定块池大小和调度并发上限；按调度起止步回放分配/释放，结束 used=0；
+  schedsim → 合成 SSE → bench 的时序还原误差 < 1e-9。
 
 **没做**（写清楚是为了不让人误读上面的数字）：
 
 - **没有任何真实 GPU 性能数字。** 本机无 NVIDIA GPU（`nvidia-smi` / `nvcc` 均不存在），
   所有吞吐/延迟数字要么是 CPU 上的确定性计算，要么是本地 mock server 的实测。
-  Part 4b 那个 `TTFT=40.8ms` 是「本机 HTTP 往返 + mock 服务端」的开销，**不是模型推理延迟**；
+  Part 4b 的 TTFT 是「本机 HTTP 往返 + mock 服务端」的开销，**不是模型推理延迟**；
 - 不实现 Attention kernel、不做 kernel fusion、不碰 CUDA/Triton；
 - 不 fork vLLM，不与 vLLM 的调度器逐位对齐（只对齐它源码里写明的语义）；
 - `schedsim` 是**模拟器**，它的数字是「按这个时间模型应该发生什么」，不是实测；
@@ -249,11 +259,11 @@ usage.completion_tokens; do NOT count chunks.
   （`IDEAL_PAYLOAD_ONLY` 已标出这一点）；
 - 没有接入真实 tokenizer，`bench` 在无 usage 的流上需要调用方自己传 `token_counter`。
 
-**下一步要做的**（需要云端 GPU，当前凭据不可用）：
+**下一步要做的**（真实引擎验证需云端 GPU）：
 
 - 在真实 vLLM / SGLang 上跑 `bench`，把 TTFT/TPOT 与引擎自带 `vllm bench serve` 对齐；
 - 用 `schedsim` 拟合真实引擎的调度行为，检验时间模型的偏差是否在 10% 以内；
-- 把块池换成 C++ 实现，与 Python 版做逐操作对拍。
+- 对照已有的 `aidless/paged-kv` C++ 实现，增加逐操作对拍。
 
 ---
 
@@ -264,10 +274,11 @@ kv_serve_lab/
   kvcalc/       # 显存公式 + 容量规划
   blockpool/    # 块池 / 前缀复用 / COW
   schedsim/     # 连续批处理调度模拟
+  integration.py # 容量驱动与生命周期回放
   bench/        # SSE 解析 + 指标聚合
     client.py       # 真实 HTTP 流式客户端
     mock_server.py  # 可控的 SSE mock 服务端
-tests/          # 138 项，全部 CPU 可跑
+tests/          # 180 项，全部 CPU 可跑
 examples/demo.py
 docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ```
@@ -275,9 +286,11 @@ docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ## 测试
 
 ```bash
-python3 -m pytest                              # 138 passed
+python3 -m pytest                              # 180 passed
 python3 -m pytest tests/test_calibration.py -q  # 只看与真实引擎对账的那 11 项
 ```
+
+学习顺序和源码入口见 [GitHub 学习地图](docs/GITHUB-MAP.md)。
 
 ## 许可
 

@@ -25,7 +25,8 @@ from kv_serve_lab.bench import summarize, trace_from_payloads
 from kv_serve_lab.bench.client import stream_request
 from kv_serve_lab.bench.mock_server import SSEMockServer, per_token_plan
 from kv_serve_lab.kvcalc import ModelShape, plan_capacity
-from kv_serve_lab.schedsim import Request, SimConfig, Simulator
+from kv_serve_lab.integration import run_pipeline
+from kv_serve_lab.schedsim import Request, SimConfig
 
 GIB = 1024 ** 3
 
@@ -76,22 +77,29 @@ def part2_blockpool() -> None:
     print(f"  COW：原块 {hit} ref 降为 {pool.ref_count_of(hit)} 且保留前缀；"
           f"新块 {new} 独占可写，payload={pool.read_payload(new)}")
     print(f"  audit: {pool.audit()}")
+    pool.free([*a, new])
+    print(f"  释放所有请求引用后: {pool.audit()}")
     print()
 
 
-def part3_schedsim() -> tuple[SimConfig, list[Request], object]:
+def part3_schedsim(shape: ModelShape) -> tuple[SimConfig, list[Request], object]:
     print("=" * 70)
     print("Part 3  schedsim — 连续批处理调度预测")
     print("=" * 70)
-    cfg = SimConfig(max_num_batched_tokens=256, max_num_seqs=4, step_sec=0.01)
-    reqs = [Request(f"r{i}", prompt_tokens=16, output_tokens=32) for i in range(8)]
-    arrivals = [i * 0.02 for i in range(8)]
-    res = Simulator(cfg).run(reqs, arrivals)
+    pipeline = run_pipeline(
+        shape, gpu_mem_bytes=24 * GIB, dtype="bfloat16", seq_len=4096,
+        prompt_tokens=16, output_tokens=32, num_requests=8, step_sec=.01,
+        max_num_batched_tokens=256,
+    )
+    cfg, res = pipeline.config, pipeline.sim
+    reqs = [Request(f"r{i}", 16, 32) for i in range(8)]
+    print(f"  容量驱动: max_num_seqs={cfg.max_num_seqs}, pool_blocks={pipeline.pool_blocks}")
+    print(f"  生命周期回放: peak_blocks={pipeline.peak_blocks_in_use}, final={pipeline.audit}")
     m = res.metrics()
-    print("配置：budget=256, max_num_seqs=4, step=0.01s；8 请求,prompt16/output32")
+    print(f"配置：budget=256, max_num_seqs={cfg.max_num_seqs}, step=0.01s；8 请求,prompt16/output32")
     print(f"  mean TTFT = {m.mean_ttft_sec:.4f}s, p99 = {m.p99_ttft_sec:.4f}s")
     print(f"  mean latency = {m.mean_latency_sec:.4f}s")
-    print(f"  饱和稳态吞吐 = {res.steady_state_throughput:.1f} tok/s"
+    print(f"  满载窗口吞吐（未满载则为整段）= {res.steady_state_throughput:.1f} tok/s"
           f"（解析上界 max_num_seqs/step = {cfg.max_num_seqs / cfg.step_sec:.0f}）")
     print()
     return cfg, reqs, res
@@ -112,7 +120,7 @@ def part4_bench_closure(reqs: list[Request], res) -> None:
         pred_tpot = st.tpot_for(out_len)
         payloads = [
             (st.arrival_sec + st.ttft_sec + i * pred_tpot,
-             '{"choices":[{"text":"tok"}]}')
+             '{"choices":[{"text":"tok "}]}')
             for i in range(out_len)
         ]
         tr = trace_from_payloads(
@@ -139,9 +147,9 @@ def part4_bench_closure(reqs: list[Request], res) -> None:
 
 
 def main() -> None:
-    part1_kvcalc()
+    shape = part1_kvcalc()
     part2_blockpool()
-    cfg, reqs, res = part3_schedsim()
+    cfg, reqs, res = part3_schedsim(shape)
     part4_bench_closure(reqs, res)
     print("=" * 70)
     print("四模块闭环完成。所有数字均为 CPU 上确定性计算或本地 mock 实测，")

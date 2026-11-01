@@ -1,0 +1,63 @@
+{
+  "models": [
+    {
+      "model_id": "Qwen/Qwen2.5-7B-Instruct",
+      "url": "https://hf-mirror.com/Qwen/Qwen2.5-7B-Instruct/resolve/main/config.json",
+      "retrieved_at": "2026-11-01T02:50:42.610924+00:00",
+      "file": "Qwen--Qwen2.5-7B-Instruct.json",
+      "sha256": "7463bb0ea78315365e6c6b74de4e73bbcc8359dfb0c5a737584e077d42c0b03c"
+    },
+    {
+      "model_id": "Qwen/Qwen2.5-72B-Instruct",
+      "url": "https://hf-mirror.com/Qwen/Qwen2.5-72B-Instruct/resolve/main/config.json",
+      "retrieved_at": "2026-11-01T02:50:42.207275+00:00",
+      "file": "Qwen--Qwen2.5-72B-Instruct.json",
+      "sha256": "14ca217334fe0fd10148413592d68c99eeb33431ed89c1afa130fee560be2a29"
+    },
+    {
+      "model_id": "mistralai/Mistral-7B-v0.3",
+      "url": "https://hf-mirror.com/mistralai/Mistral-7B-v0.3/resolve/main/config.json",
+      "retrieved_at": "2026-11-01T02:50:42.575768+00:00",
+      "file": "mistralai--Mistral-7B-v0.3.json",
+      "sha256": "affafc6478ec0fd07a32f0ca57aa2fc57743f4d17d6730f86a96ac24d1507f99"
+    },
+    {
+      "model_id": "deepseek-ai/DeepSeek-V2-Lite",
+      "url": "https://hf-mirror.com/deepseek-ai/DeepSeek-V2-Lite/resolve/main/config.json",
+      "retrieved_at": "2026-11-01T02:50:42.616412+00:00",
+      "file": "deepseek-ai--DeepSeek-V2-Lite.json",
+      "sha256": "f346286b0f1c8b044252fd54cb4fa78b9fab6472a6e8bebb9edfe03d414ea03d"
+    },
+    {
+      "model_id": "Qwen/Qwen3-4B",
+      "url": "https://hf-mirror.com/Qwen/Qwen3-4B/resolve/main/config.json",
+      "retrieved_at": "2026-11-01T02:50:42.777139+00:00",
+      "file": "Qwen--Qwen3-4B.json",
+      "sha256": "8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a"
+    }
+  ],
+  "calibration": {
+    "source_workspace_path": "arc2/out/gpu_baseline/full.log",
+    "source_sha256": "d02b8d6fc98ded7a6012ad697080e7276267da2c297f62a22f46a73e0f0371b0",
+    "excerpt_file": "vllm-calibration-excerpt.log",
+    "excerpt_sha256": "18d30d59981402a3b1a57a5e1f9a63fcf47eb48618d523bb8fab0b7daa3b97c0",
+    "source_line_numbers": [
+      3,
+      6,
+      8,
+      12,
+      16,
+      24,
+      25,
+      26,
+      27
+    ],
+    "run_date": "2026-10-21",
+    "engine_version": "v0.16.1.dev0+g89a77b108.d20260317",
+    "checkpoint": "qwen3_4b_grids15_sft139 (fine-tuned Qwen3-4B)",
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "gpu_model": "not recorded in this log; not inferred",
+    "purpose": "historical capacity arithmetic only; no current GPU benchmark"
+  }
+}

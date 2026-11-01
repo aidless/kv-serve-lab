@@ -33,7 +33,7 @@ def payloads_from_timed_lines(timed_lines):
 
 
 def _collect_timed_lines(url: str, payload: dict, timeout: float):
-    """发请求并逐行记录 (相对时间, line)。相对时间以请求发出为 0。"""
+    """发请求并记录共享单调时钟时间戳，同时返回请求起点。"""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
@@ -43,8 +43,8 @@ def _collect_timed_lines(url: str, payload: dict, timeout: float):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:  # 逐行迭代，服务端 flush 后即时拿到
             t = time.perf_counter()
-            timed.append((t - t0, raw.decode("utf-8", "replace")))
-    return timed
+            timed.append((t, raw.decode("utf-8", "replace")))
+    return t0, timed
 
 
 def stream_request(
@@ -56,13 +56,14 @@ def stream_request(
     token_counter=None,
     timeout: float = 30.0,
 ) -> RequestTrace:
-    """发一个流式请求并返回 RequestTrace（start_sec 归一为 0）。
+    """发一个流式请求，保留共享单调时钟，以便多个 trace 汇总吞吐。
 
-    token_counter 必填（否则带文本的 chunk 会触发 BenchError——那是故意的）：
-    调用方负责提供真实 tokenizer 或改用服务端 usage 计数。
+    无服务端 usage 时需要 token_counter，输入为拼接后的完整输出文本。
+    当前仅发送 prompt/max_tokens/stream，面向本地 mock；真实服务的 model、鉴权
+    和 stream_options 配置尚未提供。
     """
-    timed = _collect_timed_lines(
+    start_sec, timed = _collect_timed_lines(
         url, {"prompt": prompt, "max_tokens": max_tokens, "stream": True}, timeout
     )
     payloads = payloads_from_timed_lines(timed)
-    return trace_from_payloads(req_id, 0.0, payloads, token_counter=token_counter)
+    return trace_from_payloads(req_id, start_sec, payloads, token_counter=token_counter)

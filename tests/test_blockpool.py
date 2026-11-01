@@ -406,3 +406,58 @@ class TestDocstringClaims:
         doc = bp.__doc__ or ""
         assert "不做 block 去重" not in doc
         assert "简化" in doc
+
+
+class TestCowOnSoleHashedOwner:
+    """独占但已登记前缀的块，也必须 COW 出可写副本。
+
+    真实场景：某个前缀块被登记后，唯一持有它的请求想继续写它（追加下一块之前先改末块，
+    或该请求释放后另一个请求 acquire 到它再想分叉）。若 copy_on_write 在 ref_count==1
+    时直接返回原块，调用方拿到的仍是「带 hash、不可写」的块，write_payload 立刻报错。
+    """
+
+    def test_sole_hashed_owner_gets_writable_copy(self):
+        pool = BlockPool(num_blocks=8, block_size=16)
+        bid = pool.allocate(1)[0]
+        tokens = list(range(16))
+        pool.write_payload(bid, tokens)
+        pool.register_prefix("h1", bid)
+
+        new = pool.copy_on_write(bid)
+        assert new != bid, "已登记前缀的块内容不可变，必须复制出新块"
+        assert pool.is_block_writable(new) is True
+        pool.write_payload(new, [999] * 16)          # 新块可写
+        assert pool.read_payload(bid) == tuple(tokens)  # 原块内容不变
+        assert pool.lookup_prefix("h1") == bid          # 前缀映射仍指向原块
+        assert pool.hash_of(new) is None
+
+    def test_unhashed_sole_owner_is_noop(self):
+        pool = BlockPool(num_blocks=4, block_size=16)
+        bid = pool.allocate(1)[0]
+        assert pool.copy_on_write(bid) == bid
+
+
+class TestHashIndexConsistency:
+    """守恒检查必须真的核对 hash 索引，否则悬空/错指 hash 永远查不出来。"""
+
+    def test_detects_hash_pointing_to_block_without_that_hash(self):
+        pool = BlockPool(num_blocks=4, block_size=16)
+        bid = pool.allocate(1)[0]
+        pool._hash_to_block["wrong-hash"] = bid  # 注入：块并未持有该 hash
+        with pytest.raises(BlockPoolError, match="conservation"):
+            pool._check_conservation()
+
+    def test_superseded_hash_is_legal(self):
+        """同一 hash 被更晚的块覆盖后，旧块留着 hash 是合法状态，不算违规。
+
+        这正是 vLLM 的行为：BlockHashToBlockMap 只保留最新映射，旧块的
+        block_hash 属性仍在，且它的 hash 已不再指向自己。
+        """
+        pool = BlockPool(num_blocks=4, block_size=16)
+        a, b = pool.allocate(2)
+        pool.write_payload(a, list(range(16)))
+        pool.write_payload(b, list(range(16)))
+        pool.register_prefix("h", a)
+        pool.register_prefix("h", b)
+        pool._check_conservation()  # 不应报错
+        assert pool.lookup_prefix("h") == b

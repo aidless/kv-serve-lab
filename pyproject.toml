@@ -21,6 +21,7 @@ classifiers = [
 dependencies = []  # 运行时纯标准库
 
 [project.optional-dependencies]
+tokenizer = ["tokenizers>=0.15", "transformers>=4.40"]
 dev = ["pytest>=8"]
 
 [project.urls]

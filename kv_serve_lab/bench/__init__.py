@@ -37,8 +37,12 @@ __all__ = [
 ]
 
 
-class BenchError(Exception):
-    """bench 层的输入/度量错误（如 chunk≠token 却没给 tokenizer）。"""
+class BenchError(ValueError):
+    """bench 层的输入/度量错误（如 chunk≠token 却没给 tokenizer）。
+
+    继承 ValueError 而非裸 Exception：这些都是**调用方参数或用例本身**错了，
+    调用方按 ValueError 捕获即可，不必单独 import 本模块的异常类型。
+    """
 
 
 @dataclass(frozen=True)

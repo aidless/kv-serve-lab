@@ -212,6 +212,10 @@ step_time = step_overhead + (prefill_tokens × t_prefill_token) + (decode_reqs �
 
 **闭环断言**：第 4 步还原出的 TTFT/TPOT 与第 3 步预测值的相对误差 < 1%。这条跑通，才说明四个模块真能互相咬合。
 
+> ⚠️ **这条闭环测的是什么，必须写清（2026-11-01 实测修正）**：`tests/test_bench_closure.py` 的确定性闭环是**从 `schedsim` 的预测值反向合成 SSE 时间戳**（`_synthesize_payloads` 用 `st.ttft_sec` / `pred_tpot` 逐 token 布点），所以 <1% 甚至 <1e-9 都只能证明**解析层与公式没写错**，不能证明模拟器预测接近真实引擎——预测错了也会被原样还原。它仍然有测试价值：把 TPOT 分母从 `(n−1)` 改成 `n` 后该测试立刻变红（已实测），说明它抓得住口径错误。
+>
+> 真正能证伪的闭环需要一个**自己产生时序、且模拟器独立预测**的通道。`examples/demo.py:136-146` 的真 socket 路径（mock server 注入 `ttft=0.02/tpot=0.005`）具备这个形状，但当前只打印不检查。把它变成断言（注入已知时序 → 断言实测值落在容差内）是下一步唯一有信息量的增量。
+
 ## 6. 留给 builder 的决定
 
 - 包的目录结构细节（是否用 `src/` 布局）
@@ -282,3 +286,25 @@ step_time = step_overhead + (prefill_tokens × t_prefill_token) + (decode_reqs �
 本设计落盘期间，`kv-serve-lab/` 目录**正被另一个并行会话实时写入**：`kv_serve_lab/kvcalc/__init__.py`(172 行)、`blockpool/__init__.py`(285 行)、`schedsim/__init__.py`(407 行)、四个测试文件，mtime 18:29–18:51，`python3 -m pytest` 当前因 `ImportError: cannot import name 'IDEAL_PAYLOAD_ONLY'` 在收集阶段失败。`scripts/dsh-idle-check.py` 报 **9 个会话正在干活**。
 
 **处置**：本会话不往 `kv-serve-lab/` 写产品代码（避免双写覆盖），只写这份设计文档与普查结论。产品代码归正在写它的那个会话。
+
+---
+
+## 11. 规格评审九问的逐项裁决（2026-11-01）
+
+评审来自独立子代理（读本文件 254 行版、`kv-serve-lab` 仓库、`infer-engine-track/PLAN-kv-serve-lab.md` 与 `evidence/`）。下表每条都经本会话**独立重跑**验证，不是转述。状态三值：`PASS`（评审说得对，已改）/ `PASS-CORRECTED`（结论对但细节需修正）/ `REFUTED`（不成立）。
+
+| # | 评审指控 | 我的实测 | 裁决 |
+|---|---|---|---|
+| 1 | 规格描述的东西**已经建完并推送**，greenfield 计划会与既成事实冲突 | 仓库存在、已推送、`pytest` 180 passed | **PASS** — 规格已从「待批准的新建计划」转为「对已实现系统的语义规格 + 缺口清单」 |
+| 2 | §4.3 声明三个时间常数「测试里必须写死」，但规格全文无任何具体数值 | `grep step_overhead\|t_prefill_token\|t_decode_token` 只命中公式与要求，无值 | **PASS** — 已补「两种时间模型 + 两条上界公式」表；常数取值仍属 builder 决定，但**已说明为何不需要全局唯一值**（见 #3） |
+| 3 | 规格只写成本模型，实现双轨（`step_sec` 与三参数），且饱和断言用的是**等时**上界 | `SimConfig.__post_init__` 双轨确认；`tests/test_schedsim.py:182` 用 `max_num_seqs/step_sec` | **PASS** — 已在 §4.3 补两式对照表，明确 demo/integration 走等时、边界测试走成本 |
+| 4 | §4.1 说 `num_key_value_heads % tp != 0` 必须抛错，实现却在 `tp > kv_heads` 时做**复制** | 实测 Mistral(8 kv heads) `tp=16` → `8%16=8≠0` 却**正常返回** 67108864，未抛错 | **PASS，且比评审更严重** — 规格漏写了 query head 那条独立校验（`28%8=4` 才是 Qwen2.5-7B tp=8 抛错的真因），也漏写了复制分支。已按实现补全三条 |
+| 5 | Little's law 的 <5% 闸是恒等式，无法失败 | 注入 `×0.97` 后 `test_schedsim_boundaries.py:30` **变红**；但饱和/不饱和三档偏差恒为 0.000% | **PASS-CORRECTED** — 「闸能失败」这半句被我的变异测试**反驳**（它能抓实现错误）；「测不到真实性」这半句成立。已按修正后表述写入 §4.3。泊松到达确实未实现（零命中） |
+| 6 | `bench` 只能对 mock，真实端点会因缺 `model`/`usage` 抛错；无 ITL、无负载生成 | `client.py:65` 请求体三项确认；`grep itl\|chunk_gap` 零命中 | **PASS** — 已在 §4.4 补「实际能力边界」四行表 |
+| 7 | §5 的 <1% 闭环是自证（从预测合成时间戳） | 读 `_synthesize_payloads` 确认；但注入 TPOT 分母 `n−1→n` 后该测试**变红** | **PASS-CORRECTED** — 自证属实，但「所以它没用」不成立：它验证的是解析层口径。已把两者分开写入 §5 |
+| 8 | 校准锚点的卡型（W7900）无日志依据，违反 §8 | `evidence/vllm-calibration-excerpt.log` 9 行**无 GPU 型号**；manifest 已写 `not recorded; not inferred`；spec 却写 W7900 | **PASS** — 已改为「硬件未记录」，并说明 48 GiB+ROCm 反推属推断 |
+| 9 | 计划是否拥有「私有→公开」这一步；G4 当前不可满足 | 认证 API 实测 `private=True, visibility=private`（匿名 403 不足以证明，评审此点判断正确但证据不足） | **PASS** — 仓库目前私有，G4（公开可用）确实未达成；翻转是**用户门控的不可逆动作**，不由计划自行执行 |
+
+**评审未提、我实测发现的一处**：`_kv_heads_per_rank` 与 `kv_bytes_for` 的校验顺序不同——`kv_bytes_for` 先查 `num_attention_heads % tp`，所以 Qwen2.5-7B `tp=8` 抛的是 query head 那条错误信息，而不是规格暗示的 kv head 那条。两条校验都在，但**报错归属与规格叙述不一致**。已并入 #4 的修正。
+
+**明确不作为缺陷的四项**（评审已自行排除，我同意）：`blockpool.audit()` 的派生 `cached` 计数（可判定、非守恒式）、`scheduler.py:698` vs 实际 `:700-708` 的两行漂移、`examples/end_to_end.py` 与 `demo.py` 的命名差异、`requires-python` 与实测 3.10 的不一致。

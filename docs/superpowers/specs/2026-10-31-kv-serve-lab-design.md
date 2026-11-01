@@ -84,7 +84,9 @@ kv-serve-lab/
 
 | Qwen3-4B | GQA | 36 层 / 32 heads / 8 kv_heads / hidden 2560 / head_dim 128（config 显式给） | 147,456 | 0.5625 GiB |
 
-校准依据（**三个量各自独立，不是循环论证**）：真实 vLLM 运行日志（W7900 48 GiB，bf16，`gpu_memory_utilization=0.8`，Qwen3-4B 微调权重）分别打印了：
+校准依据（**三个量各自独立，不是循环论证**）：真实 vLLM 运行日志（bf16，`gpu_memory_utilization=0.8`，Qwen3-4B 微调权重）分别打印了：
+
+> ⚠️ **硬件未记录（2026-11-01 修正）**：本文原写「W7900 48 GiB」，但该日志**没有任何一行记录 GPU 型号或驱动版本**（`evidence/vllm-calibration-excerpt.log` 全文 9 行，只出现 `rocm.py:377 Using Triton Attention backend`）。`evidence/manifest.json:60` 已按实情写 `"gpu_model": "not recorded in this log; not inferred"`。**卡型是从「48 GiB + ROCm」反推的，属于推断不是实测**，因此 §8 数字纪律对这条锚点的正确处置是「不标卡型」而非「标 W7900」。本仓库内不做任何依赖具体卡型的断言。
 
 | 日志行 | 引擎输出 | 谁测的 |
 |---|---|---|
@@ -99,7 +101,11 @@ kv-serve-lab/
 **测试要求**：
 - 上表四个值逐字断言（测试里写死数字，不是重算一遍再比——重算会一起错）。
 - `head_dim` 从 `hidden_size / num_attention_heads` 推导，config 里若显式给了 `head_dim` 则优先用它。
-- TP 并行度 > 1 时：kv_heads 按 TP 切分（`num_key_value_heads % tp != 0` 时明确抛错，不静默取整）。
+- TP 并行度 > 1 时，**query head 与 kv head 各自独立校验**（2026-11-01 按实现回填，原文只写了 kv head 一条）：
+  - `num_attention_heads % tp != 0` → 抛错（这一层根本切不开）；
+  - `tp <= num_kv_heads` 时要求 `num_kv_heads % tp == 0`，每 rank 分 `num_kv_heads // tp` 个；
+  - `tp > num_kv_heads` 时切不动了，改为**复制**（多 rank 共享同一 kv head），要求 `tp % num_kv_heads == 0`，每 rank 1 个。
+  - 以上三条任一不满足都抛 `ValueError`，绝不静默取整。复制分支是 vLLM 的真实行为，不是本项目的简化。
 
 ### 4.2 `blockpool` — PagedAttention 块管理器
 
@@ -144,6 +150,15 @@ step_time = step_overhead + (prefill_tokens × t_prefill_token) + (decode_reqs �
 
 其中 `prefill_tokens` = 本 step 分配给各请求的新 prompt token 总数（chunked prefill 下可为部分），`decode_reqs` = 本 step 处于 decode 的请求数。`step_overhead` 是每 step 固定开销（权重读取），这是为什么并发高时吞吐上升——**单 token 成本随批量摊薄**。三个参数都是模拟器的**输入常数**，不是拟合出来的，测试里必须写死。
 
+**两种时间模型并存，上界公式不同（2026-11-01 按实现回填）**：`SimConfig` 同时接受 `step_sec`（等时模型：每 step 固定 `step_sec`）与上面三个成本参数（成本模型）。二者互斥地决定 `step_time()`：三个成本参数全为 0 时返回 `step_sec`，否则走成本模型。因此**解析上界有两条式子，不能混用**：
+
+| 模型 | 饱和吞吐上界 | 出处 |
+|---|---|---|
+| 等时（`step_sec`） | `max_num_seqs / step_sec` | `schedsim/__init__.py:30`、`tests/test_schedsim.py:182` |
+| 成本（三参数） | `max_num_seqs / (step_overhead + max_num_seqs × t_decode_token)` | 本节下条 |
+
+当前 demo（`examples/demo.py:91`）、集成路径（`integration.py:46`）与饱和断言（`tests/test_schedsim.py:182-186`）**走的是等时模型**；成本模型由 `tests/test_schedsim_boundaries.py:24-32` 等边界测试覆盖。两条式子各自被断言，不要把等时上界写成成本上界（反之亦然）。
+
 **验收方式**（对解析上界，偏差超阈值即失败）：
 
 - **decode 饱和吞吐上界**：decode 每 step 每请求产 1 token，故 `throughput_max = max_num_seqs / (step_overhead + max_num_seqs × t_decode_token)`。**注意**：不是 `max_num_batched_tokens / t_decode_token`——那个式子量纲不对，token 预算约束的是**每 step 调度多少 token**（含 chunked prefill），不是并发数上限。
@@ -151,6 +166,10 @@ step_time = step_overhead + (prefill_tokens × t_prefill_token) + (decode_reqs �
 - **TTFT 下界**：当系统空载时，`TTFT >= step_overhead + prompt_len × t_prefill_token`，模拟不得违反
 
 阈值（初始值，可在实现中按实测调整但必须写进测试）：Little's law 偏差 < 5%；饱和吞吐偏差 < 10%。
+
+**关于 Little's law 这条闸的真实强度（2026-11-01 实测修正）**：原设计把「模拟值偏差 < 5%」写成一条会失败的验收闸，但实现里 `mean_system_requests` 与 `arrival_rate × mean_latency` 都由同一段区间积分导出（`schedsim/__init__.py:411` 用 `sum(step_system_areas)/now`），因此它在数学上是恒等式——实测饱和（20 与 50 请求挤 4 槽）与不饱和三档偏差均为 **0.000%**。它**能**抓住积分实现错误（注入 `×0.97` 后 `tests/test_schedsim_boundaries.py:30` 立刻变红，已实测），但**不能**检验「模拟器是否贴近真实引擎」。等时模型下这条关系本身成立，不属于近似。若将来要让它成为有信息量的闸，须换成独立来源的对照（真实引擎 trace），不能靠调阈值。
+
+**泊松到达未实现**：`grep -n "random\|seed\|poisson" schedsim/` 零命中，当前只支持显式传入到达时刻列表。设计里的「固定速率 / 泊松」二选一，实现只做了前者；泊松需在引入随机源时同时固定 seed 与测量窗口，否则不可复算。
 
 ### 4.4 `bench` — OpenAI 兼容端点压测客户端
 
@@ -170,6 +189,17 @@ step_time = step_overhead + (prefill_tokens × t_prefill_token) + (decode_reqs �
 **本地可验证部分（纯 CPU）**：写一个 mock SSE server，注入**已知时序**（比如首 token 在 100ms、之后每 20ms 一个 token），断言算出来的 TTFT/TPOT 与注入值逐毫秒相等。再注入「一个 chunk 带 3 个 token」的时序，断言 `output_len` 按 token 计而非 chunk 计。
 
 **需要 GPU 的部分**：真实端点对比 → 明确标「待云端验证」，不编数字。README 里给出跑法，但不放任何未实测的数字。
+
+**实际能力边界（2026-11-01 按实现回填，比原文更窄）**：
+
+| 项 | 设计期望 | 实现现状 |
+|---|---|---|
+| 端点 | 任意 OpenAI 兼容（vLLM/SGLang/TGI） | `bench/client.py:65` 请求体只有 `{prompt, max_tokens, stream}`，**无 `model`、无鉴权头、无 `stream_options.include_usage`** |
+| 真实端点可用性 | 直接可跑 | vLLM 默认不回 usage 且返回 text-only chunk → `trace_from_payloads` 在 `bench/__init__.py:213` 抛 `BenchError`，除非调用方自带 `token_counter` |
+| ITL | §4.4 列为输出 | **未实现**，`grep -n "itl\|chunk_gap" bench/` 零命中 |
+| 负载生成 | 压测客户端 | 只有单请求 `stream_request`，**无并发/速率生成器** |
+
+因此 `bench` 当前定位是**协议解析与指标口径的可测实现**（用 mock server 验证口径对不对），不是开箱即用的压测工具。要指向真实 vLLM/SGLang，最小改动是补 `model` 字段与 `stream_options.include_usage=true`——但那需要在有 GPU 的环境实测，属于「待云端验证」。更完整的端点压测直接复用 `aidless/ttftkit`（已覆盖 ITL、并发、fail-closed 门禁）。
 
 ## 5. 模块之间怎么串起来（这是「一个系统」而不是「四个玩具」的关键）
 

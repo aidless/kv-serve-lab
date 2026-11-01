@@ -36,6 +36,7 @@ python3 examples/demo.py   # 四模块闭环，全程无 GPU
 `examples/demo.py` 的真实输出（CPU 确定性计算 + 本地 mock server，无 GPU）：
 
 ```text
+======================================================================
 Part 1  kvcalc — KV cache 容量规划
 ======================================================================
 Qwen2.5-7B 每 token KV = 57344 B（全 28 层）
@@ -77,7 +78,6 @@ Part 4  bench — 预测回放成 SSE，再『实测』回来（闭环）
 [4b] 真实 HTTP 流式（mock 服务端，含毫秒级网络开销）：
   实测 TTFT=<每次运行不同，含 HTTP 与 mock 延迟>
   实测 TPOT=<每次运行不同>，output_len=8，chunk_count=8
-
 ```
 
 Part 4a 是**闭环的关键**：`schedsim` 预测出的 TTFT/TPOT 被合成成 SSE 时间线，再喂给

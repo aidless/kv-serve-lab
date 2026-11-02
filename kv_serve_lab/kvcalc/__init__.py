@@ -183,6 +183,42 @@ class ModelShape:
             pass
         return total
 
+    def kv_bytes_per_token_with_compression(
+        self,
+        dtype: str,
+        value_bytes: float,
+        key_bytes: float | None = None,
+    ) -> float:
+        """按「每 token 每元素字节数」算压缩后的 KV 字节/token（建模值）。
+
+        ``value_bytes`` / ``key_bytes`` 是压缩后**每个元素**占的字节数，用于建模
+        KV 压缩（arXiv:2603.20397 综述的量化/投影类方向）。这是**建模估计**，不是
+        实测：真实压缩 KV 还有 scale/group 元数据、对齐 padding 与 dequant 开销，
+        且 GQA 的压缩是否逐 head 独立会显著改变结果，故标注 IDEAL_PAYLOAD_ONLY
+        同款提醒——不要把它当实测显存占用用。
+
+        与 :meth:`kv_bytes_per_token` 的差异：后者按 dtype 字节数（fp16=2、fp8=1）
+        算每元素，这里允许任意压缩后的每元素字节（如 int4=0.5、fp8 加 scale）。
+        """
+        if value_bytes <= 0:
+            raise ValueError(f"value_bytes must be > 0, got {value_bytes}")
+        if key_bytes is not None and key_bytes <= 0:
+            raise ValueError(f"key_bytes must be > 0, got {key_bytes}")
+        # 每层每 token 的元素数（与 kv_bytes_per_token 同构）：
+        #   GQA: 2 * n_kv_heads * head_dim（K、V 各一份）
+        #   MLA: (kv_lora_rank + qk_rope_head_dim)（压缩的 KV 潜变量 + RoPE 分量）
+        if self.is_mla:
+            elements_per_layer_per_token = self.kv_lora_rank + self.qk_rope_head_dim
+            kv_element_bytes = value_bytes
+        else:
+            elements_per_layer_per_token = 2 * self.num_kv_heads * self.head_dim
+            kv_element_bytes = value_bytes + (key_bytes if key_bytes is not None else value_bytes)
+        return (
+            self.num_layers
+            * elements_per_layer_per_token
+            * kv_element_bytes
+        )
+
 
 @dataclass(frozen=True)
 class CapacityPlan:

@@ -371,9 +371,6 @@ class SimResult:
             return float("nan")
         return 1.0 - (violated / total)
 
-    def per_request_tpot(self, req_id: str) -> float:
-        return self.requests[req_id].tpot_for(self._output_lens[req_id])
-
     def metrics(self) -> Metrics:
         if not self.requests:
             return Metrics(0.0, 0.0, 0.0, 0)

@@ -387,3 +387,73 @@ class TestDocstringSemantics:
         doc = plan_capacity.__doc__ or ""
         assert "gpu_memory_utilization" in doc
         assert "KV cache" in doc
+
+
+class TestCompressionMetric:
+    """KV 压缩口径（arXiv:2603.20397 综述的量化/投影类方向）。
+
+    这是**建模估计**，不是实测——真实压缩 KV 有 scale/group 元数据、
+    对齐 padding 与 dequant 开销，且 GQA 压缩是否逐 head 独立会显著改变结果。
+    本类只验证「建模公式本身正确」，不把建模值当实测值。
+    """
+
+    def test_int4_halves_fp16_bytes_for_gqa(self):
+        """Qwen3-4B GQA：每元素 0.5 byte（int4 理想打包）→ 正好 fp16 的一半。"""
+        shape = ModelShape(
+            num_layers=36, num_attention_heads=32, num_kv_heads=8,
+            head_dim=128, max_position_embeddings=32768,
+        )
+        fp16 = shape.kv_bytes_per_token("float16")
+        c4 = shape.kv_bytes_per_token_with_compression("float16", value_bytes=0.5)
+        assert c4 == pytest.approx(fp16 / 2)
+
+    def test_fp8_same_as_fp16_with_value_bytes_one(self):
+        """每元素 1 byte 且 K/V 同宽 → 与 fp16 同字节（无压缩）。"""
+        shape = ModelShape(
+            num_layers=36, num_attention_heads=32, num_kv_heads=8,
+            head_dim=128, max_position_embeddings=32768,
+        )
+        fp16 = shape.kv_bytes_per_token("float16")
+        c8 = shape.kv_bytes_per_token_with_compression("float16", value_bytes=1.0)
+        assert c8 == pytest.approx(fp16)
+
+    def test_mla_uses_latent_dimension(self):
+        """MLA 只压 latent：每层每 token = (kv_lora_rank + qk_rope_head_dim) 元素。"""
+        mla = ModelShape(
+            num_layers=27, num_attention_heads=16, num_kv_heads=0,
+            head_dim=128, max_position_embeddings=16384,
+            is_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+        )
+        # 每元素 0.5 byte：27 × (512+64) × 0.5 = 7776
+        c4 = mla.kv_bytes_per_token_with_compression("float16", value_bytes=0.5)
+        assert c4 == pytest.approx(7776.0)
+        # fp16 基线 = 27 × 576 × 2 = 31104
+        fp16 = mla.kv_bytes_per_token("float16")
+        assert fp16 == 31104
+        assert c4 == pytest.approx(fp16 / 4)
+
+    def test_rejects_non_positive_value_bytes(self):
+        shape = ModelShape(
+            num_layers=36, num_attention_heads=32, num_kv_heads=8,
+            head_dim=128, max_position_embeddings=32768,
+        )
+        with pytest.raises(ValueError, match="value_bytes must be > 0"):
+            shape.kv_bytes_per_token_with_compression("float16", value_bytes=0)
+        with pytest.raises(ValueError, match="value_bytes must be > 0"):
+            shape.kv_bytes_per_token_with_compression("float16", value_bytes=-1)
+
+    def test_rejects_non_positive_key_bytes(self):
+        shape = ModelShape(
+            num_layers=36, num_attention_heads=32, num_kv_heads=8,
+            head_dim=128, max_position_embeddings=32768,
+        )
+        with pytest.raises(ValueError, match="key_bytes must be > 0"):
+            shape.kv_bytes_per_token_with_compression(
+                "float16", value_bytes=0.5, key_bytes=0
+            )
+
+    def test_docstring_flags_ideal_payload_only(self):
+        """docstring 必须明确警告「建模值 ≠ 实测值」。"""
+        doc = ModelShape.kv_bytes_per_token_with_compression.__doc__ or ""
+        assert "建模" in doc
+        assert "实测" in doc

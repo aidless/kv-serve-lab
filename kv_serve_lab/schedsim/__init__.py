@@ -141,14 +141,57 @@ class ShortestJobFirstPolicy(SchedulerPolicy):
         )
 
 
+class DeadlineAwarePolicy(SchedulerPolicy):
+    """SLO 感知调度：**绝对截止时刻最早**的请求先接。
+
+    key = deadline 绝对时刻（arrival_sec + deadline_sec）。没有 deadline 的请求
+    排最后（等价于无穷大），它们之间按 FCFS 保序。
+
+    这与 SLOWeave / Fairness-Aware 的「越接近 deadline 越优先」一致，是
+    最直接的 SLO 调度：把「谁快超时」显式变成调度优先级。它不需要任何
+    运行时估计——deadline 是请求自带的属性。
+    """
+
+    name = "deadline"
+
+    def select(
+        self,
+        queued: list["_State"],
+        now: float,
+        step: int,
+    ) -> int | None:
+        if not queued:
+            return None
+        return min(
+            range(len(queued)),
+            key=lambda i: (
+                self._deadline_of(queued[i]),
+                queued[i].arrival_sec,
+                i,
+            ),
+        )
+
+    @staticmethod
+    def _deadline_of(st: "_State") -> float:
+        if st.req.deadline_sec is None:
+            return math.inf
+        return st.arrival_sec + st.req.deadline_sec
+
+
 def build_policy(name: str, **kwargs: float) -> SchedulerPolicy:
-    """按名字构造策略。未知名字抛 ValueError（与 bad_args 错误码对齐）。"""
+    """按名字构造策略。未知名字抛 ValueError（与 bad_args 错误码对齐）。
+
+    支持：fcfs（先到先服务，vLLM v1 默认）、sjf（最短作业优先）、
+    aging（老化最短 prompt，需 aging_window）、deadline（SLO 感知）。
+    """
     if name == FCFSPolicy.name:
         return FCFSPolicy()
     if name == AgingShortestPromptFirstPolicy.name:
         return AgingShortestPromptFirstPolicy(**kwargs)
     if name == ShortestJobFirstPolicy.name:
         return ShortestJobFirstPolicy()
+    if name == DeadlineAwarePolicy.name:
+        return DeadlineAwarePolicy()
     raise ValueError(f"unknown scheduler policy: {name!r}")
 
 
@@ -157,6 +200,9 @@ class Request:
     req_id: str
     prompt_tokens: int
     output_tokens: int
+    # SLO 目标：从到达时刻起的完成时限（秒）。None 表示无 SLO 要求。
+    # 用于 DeadlineAwarePolicy 与 slo_violations 统计。
+    deadline_sec: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("prompt_tokens", "output_tokens"):
@@ -167,6 +213,13 @@ class Request:
             raise ValueError(f"{self.req_id}: prompt_tokens must be >= 1")
         if self.output_tokens < 1:
             raise ValueError(f"{self.req_id}: output_tokens must be >= 1")
+        if self.deadline_sec is not None:
+            if not isinstance(self.deadline_sec, (int, float)) \
+                    or isinstance(self.deadline_sec, bool) \
+                    or not math.isfinite(self.deadline_sec):
+                raise ValueError(f"{self.req_id}: deadline_sec must be a finite number")
+            if self.deadline_sec <= 0:
+                raise ValueError(f"{self.req_id}: deadline_sec must be > 0")
 
 
 @dataclass(frozen=True)
@@ -245,6 +298,8 @@ class RequestStats:
     first_token_sec: float   # 首 token 的绝对时刻
     finish_sec: float        # 最后一个 token 的绝对时刻
     num_preemptions: int = 0  # 被抢占次数（每次触发从头重算）
+    slo_violated: bool = False  # 完成时刻超过 deadline（无 deadline 恒 False）
+    deadline_sec: float | None = None  # 原始 SLO 要求（便于统计，None=无 SLO）
 
     @property
     def ttft_sec(self) -> float:
@@ -297,7 +352,24 @@ class SimResult:
     total_preemptions: int = 0
     recompute_tokens: int = 0        # 被抢占丢弃、需要重算的 token 总量
     peak_kv_blocks: int = 0
+    slo_violations: int = 0          # 完成时刻超过 deadline 的请求数
     _output_lens: dict[str, int] = field(default_factory=dict)
+
+    def per_request_tpot(self, req_id: str) -> float:
+        return self.requests[req_id].tpot_for(self._output_lens[req_id])
+
+    @property
+    def slo_ratio(self) -> float:
+        """SLO 达标率 = 1 - violations / 有 deadline 的请求数（无 deadline 时 NaN）。
+
+        分子是「有多少请求超过了自己的 deadline」；分母只看带了 deadline 的请求，
+        不含无 SLO 要求的请求（它们不能算违规）。
+        """
+        violated = sum(1 for s in self.requests.values() if s.slo_violated)
+        total = sum(1 for s in self.requests.values() if s.deadline_sec is not None)
+        if total == 0:
+            return float("nan")
+        return 1.0 - (violated / total)
 
     def per_request_tpot(self, req_id: str) -> float:
         return self.requests[req_id].tpot_for(self._output_lens[req_id])
@@ -686,6 +758,11 @@ class Simulator:
                 first_token_sec=st.first_token_sec,
                 finish_sec=st.finish_sec,
                 num_preemptions=st.num_preemptions,
+                slo_violated=(
+                    st.req.deadline_sec is not None
+                    and st.finish_sec > st.arrival_sec + st.req.deadline_sec
+                ),
+                deadline_sec=st.req.deadline_sec,
             )
 
         total_output = sum(r.output_tokens for r in requests)
@@ -706,6 +783,9 @@ class Simulator:
             total_preemptions=total_preemptions,
             recompute_tokens=recompute_tokens,
             peak_kv_blocks=max(step_kv_blocks) if step_kv_blocks else 0,
+            slo_violations=sum(
+                1 for s in stats.values() if s.slo_violated
+            ),
             _output_lens={r.req_id: r.output_tokens for r in requests},
         )
 

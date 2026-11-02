@@ -89,6 +89,10 @@ class BlockPool:
         self._hash_to_block: dict[str, int] = {}
         # 正在使用的块，按 LRU 顺序（用于 touch）
         self._in_use: OrderedDict[int, None] = OrderedDict()
+        # 前缀登记顺序（FIFO 逐出用）：块 id -> 登记序号。touch 不影响它，
+        # 这样 FIFO 与 LRU 在「块被 touch 过」的场景下产生真实差异。
+        self._register_seq: dict[int, int] = {}
+        self._register_counter = 0
 
     # ---- 查询 ----
 
@@ -391,6 +395,10 @@ class BlockPool:
                 del self._hash_to_block[old]
         blk.block_hash = block_hash
         self._hash_to_block[block_hash] = block_id
+        # 记录登记顺序（FIFO 逐出用）。重登记同一块不改变序号。
+        if block_id not in self._register_seq:
+            self._register_counter += 1
+            self._register_seq[block_id] = self._register_counter
 
     def lookup_prefix(self, block_hash: str) -> int | None:
         """查前缀。命中返回 block id，没命中返回 None。

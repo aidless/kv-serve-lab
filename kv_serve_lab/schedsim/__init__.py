@@ -38,6 +38,120 @@ from dataclasses import dataclass, field
 _EPS = 1e-12   # 浮点比较容差：0.05 与 0.05 可能算出 0.05000000000000002
 
 
+class SchedulerPolicy:
+    """从排队队列挑选「下一个要接入 running」的请求的策略基类。
+
+    连续批处理（continuous batching）的调度器每步要决定：在预算和 max_num_seqs
+    允许的范围内，从 waiting 队列里**按什么顺序**接纳新请求。vLLM v1 默认 FCFS
+    （waiting 是普通队列，先到先得）；但文献（arXiv:2610.15899，8 策略 × 1152 组合
+    实测）表明**aging shortest-prompt-first** 在多数 L40S 与混合负载下是最强实用
+    基线——即按「最短 prompt 优先」接纳，同时给等待久的请求累积老化权重，避免
+    饥饿。
+
+    本基类把「挑选下一个」抽象成单一方法，使 schedsim 成为策略对比测试台：
+    同一份请求序列、同一份配置，只换策略对象，即可比较 FCFS / 老化 / 最短优先
+    在时间模型下的 TTFT / TPOT / 吞吐 / SLO 差异。
+    """
+
+    name: str = "base"
+
+    def select(
+        self,
+        queued: list["_State"],
+        now: float,
+        step: int,
+    ) -> int | None:
+        """返回要接纳的 `queued` 下标；None 表示本轮不再接纳。
+
+        `now` 是当前墙钟（秒），`step` 是当前调度步号——策略可用它们实现老化
+        （等待时间 = now - arrival_sec）或按到达次序的稳定排序。
+        """
+        raise NotImplementedError
+
+
+class FCFSPolicy(SchedulerPolicy):
+    """先到先得：严格按 arrival_sec（同刻按请求序号）接纳。vLLM v1 默认。"""
+
+    name = "fcfs"
+
+    def select(
+        self,
+        queued: list["_State"],
+        now: float,
+        step: int,
+    ) -> int | None:
+        return 0
+
+
+class AgingShortestPromptFirstPolicy(SchedulerPolicy):
+    """aging shortest-prompt-first（arXiv:2610.15899 的最强实用基线）。
+
+    接纳顺序 = 按「prompt 长度」升序，但每等待一个调度步给请求累积老化权重，
+    等价于把「等待时间 / 老化窗口」折进排序键。这里用确定性实现：
+    key = prompt_tokens - aging_window * (now - arrival_sec)。
+    老化窗口越大，等待越久的请求优先级抬得越快（抗饥饿）。
+    """
+
+    name = "aging_shortest_prompt_first"
+
+    def __init__(self, aging_window: float = 1.0) -> None:
+        if not math.isfinite(aging_window) or aging_window <= 0:
+            raise ValueError(f"aging_window must be finite and > 0, got {aging_window!r}")
+        self.aging_window = aging_window
+
+    def select(
+        self,
+        queued: list["_State"],
+        now: float,
+        step: int,
+    ) -> int | None:
+        if not queued:
+            return None
+        # 等待时间按墙钟算（now - arrival_sec），越久优先级越高（键越小）。
+        return min(
+            range(len(queued)),
+            key=lambda i: (
+                queued[i].req.prompt_tokens
+                - self.aging_window * (now - queued[i].arrival_sec),
+                i,  # 平键按到达次序稳定
+            ),
+        )
+
+
+class ShortestJobFirstPolicy(SchedulerPolicy):
+    """最短剩余 job 优先（对照策略，不含老化）。
+
+    用于隔离「长度效应」与「老化效应」——论文指出 job-size 知识本身不足以
+    决定最优（batching/硬件效应也影响），所以它只作对照。
+    """
+
+    name = "shortest_job_first"
+
+    def select(
+        self,
+        queued: list["_State"],
+        now: float,
+        step: int,
+    ) -> int | None:
+        if not queued:
+            return None
+        return min(
+            range(len(queued)),
+            key=lambda i: (queued[i].req.prompt_tokens + queued[i].req.output_tokens, i),
+        )
+
+
+def build_policy(name: str, **kwargs: float) -> SchedulerPolicy:
+    """按名字构造策略。未知名字抛 ValueError（与 bad_args 错误码对齐）。"""
+    if name == FCFSPolicy.name:
+        return FCFSPolicy()
+    if name == AgingShortestPromptFirstPolicy.name:
+        return AgingShortestPromptFirstPolicy(**kwargs)
+    if name == ShortestJobFirstPolicy.name:
+        return ShortestJobFirstPolicy()
+    raise ValueError(f"unknown scheduler policy: {name!r}")
+
+
 @dataclass(frozen=True)
 class Request:
     req_id: str
@@ -69,6 +183,8 @@ class SimConfig:
     # 语义对齐 vLLM v1 的 RECOMPUTE 策略。
     kv_num_blocks: int | None = None
     kv_block_size: int = 16
+    # 调度策略：None 表示 FCFS（vLLM v1 默认）。传入策略对象即可换策略对比。
+    policy: SchedulerPolicy | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_num_batched_tokens", "max_num_seqs"):
@@ -89,6 +205,10 @@ class SimConfig:
             raise ValueError("kv_block_size must be an integer")
         if self.kv_block_size < 1:
             raise ValueError("kv_block_size must be >= 1")
+        if self.policy is not None and not isinstance(self.policy, SchedulerPolicy):
+            raise ValueError(
+                f"policy must be a SchedulerPolicy instance, got {type(self.policy).__name__}"
+            )
         cost_model = any((self.step_overhead, self.t_prefill_token, self.t_decode_token))
         if cost_model and self.step_overhead <= 0:
             raise ValueError("cost model needs positive step_overhead for every step")
@@ -441,9 +561,14 @@ class Simulator:
             # 但**本步发生过抢占就整步跳过 waiting**（scheduler.py:1049
             # `if not preempted_reqs and ...`）——否则刚被抢占的请求会立刻在
             # 同一批里反过来抢占别人，形成同批互抢的死循环。
+            # 接纳顺序由策略决定：None 默认 FCFS（queued[0]），换策略即可对比。
+            policy = cfg.policy
             while not preempted_this_step and queued and budget > 0 \
                     and len(running) < cfg.max_num_seqs:
-                st = queued[0]
+                pick = policy.select(queued, now, step) if policy is not None else 0
+                if pick is None:
+                    break
+                st = queued.pop(pick)
                 give = min(st.need, budget)
                 if kv is not None:
                     while not kv.fits(st, st.computed + give):
@@ -457,7 +582,6 @@ class Simulator:
                         preempted_this_step.append(victim)
                     if not kv.fits(st, st.computed + give):
                         break
-                queued.pop(0)
                 if st.start_step is None:
                     st.start_step = step
                 running.append(st)

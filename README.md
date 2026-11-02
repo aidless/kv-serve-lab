@@ -3,7 +3,7 @@
 四个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事
 串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
 
-纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 231 项全部通过。
+纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 281 项全部通过。
 
 > 一个用于学习推理服务的 CPU 实验仓库，覆盖显存估算、块生命周期、调度模拟和流式度量。
 > 示例输出包含确定性模拟和本地 HTTP mock；真实 GPU 性能验证尚未完成。见 [能力边界](#能力边界)。
@@ -29,7 +29,7 @@ cd kv-serve-lab
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python3 -m pytest          # 231 passed
+python3 -m pytest          # 281 passed
 python3 examples/demo.py   # 四模块闭环，全程无 GPU
 ```
 
@@ -276,6 +276,18 @@ usage.completion_tokens; do NOT count chunks.
 - 复验三方对账锚点：真实引擎启动日志的 Available KV / KV cache size 与 `kvcalc` 的
   公式结果再次交叉核对（本次为一次日志样本，扩大样本可提高置信）。
 
+**已落地的进化方向**（文献依据见 [docs/evolution-research.md](docs/evolution-research.md)）：
+
+- **可插拔调度策略**：`SchedulerPolicy` 基类 + `FCFS` / `AgingShortestPromptFirst`
+  （老化最短 prompt 优先，arXiv:2610.15899）/ `ShortestJobFirst` / `DeadlineAware`
+  （SLO 感知，arXiv:2609.07883）。`SimConfig.policy` 可注入，默认 FCFS。
+- **前缀缓存统计与可插拔逐出**：`CountingBlockPool` + `PrefixCacheStats`（命中率），
+  `LRUEvictionPolicy`（尊重 touch）与 `FIFOEvictionPolicy`（登记序号，忽略 touch，
+  验证 UniCache SIGMETRICS 2026 的异构负载论点）。
+- **SLO 违规统计**：`Request.deadline_sec` + `SimResult.slo_violations` / `slo_ratio`。
+- **KV 压缩口径**：`ModelShape.kv_bytes_per_token_with_compression` 按每元素字节数
+  建模量化/投影类压缩（arXiv:2603.20397），明确标注建模估计 ≠ 实测。
+
 ### 与已有仓库的关系
 
 同主题的 5 个仓库已覆盖大部分方向，本仓库是「把四件事串成一条 CPU 闭环的学习实验室」，
@@ -298,14 +310,14 @@ usage.completion_tokens; do NOT count chunks.
 
 ```text
 kv_serve_lab/
-  kvcalc/       # 显存公式 + 容量规划
-  blockpool/    # 块池 / 前缀复用 / COW
-  schedsim/     # 连续批处理调度模拟
+  kvcalc/       # 显存公式 + 容量规划 + 压缩口径建模
+  blockpool/    # 块池 / 前缀复用 / COW + 命中率统计与可插拔逐出
+  schedsim/     # 连续批处理调度模拟 + 可插拔策略 + SLO
   integration.py # 容量驱动与生命周期回放
   bench/        # SSE 解析 + 指标聚合
     client.py       # 真实 HTTP 流式客户端
     mock_server.py  # 可控的 SSE mock 服务端
-tests/          # 231 项，全部 CPU 可跑（含 C++ 对拍，需 g++/make）
+tests/          # 281 项，全部 CPU 可跑（含 C++ 对拍，需 g++/make）
 examples/demo.py
 docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ```
@@ -313,9 +325,11 @@ docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
 ## 测试
 
 ```bash
-python3 -m pytest                              # 231 passed
+python3 -m pytest                              # 281 passed
 python3 -m pytest tests/test_calibration.py -q  # 只看与真实引擎对账的那 11 项
 python3 -m pytest tests/test_cpp_differential.py -q  # 只看 C++/Python 对拍那 10 项
+python3 -m pytest tests/test_schedsim_policy.py -q   # 只看调度策略那 12 项
+python3 -m pytest tests/test_schedsim_slo.py -q      # 只看 SLO 感知那 21 项
 ```
 
 学习顺序和源码入口见 [GitHub 学习地图](docs/GITHUB-MAP.md)。

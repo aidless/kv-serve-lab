@@ -1,5 +1,7 @@
 # kv-serve-lab
 
+[![CI](https://github.com/aidless/kv-serve-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/aidless/kv-serve-lab/actions/workflows/ci.yml)
+
 四个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事
 串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
 

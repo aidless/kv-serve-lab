@@ -51,6 +51,11 @@ class ModelShape:
     is_mla: bool = False
     kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0
+    # 残差流宽度（hidden_size）。放在最后并给默认值，避免打乱既有的位置参数调用。
+    # 注意 hidden_size ≠ num_attention_heads × head_dim：Qwen3-4B 是 2560 ≠ 32×128=4096，
+    # 所以算通信量（`kv_serve_lab.comm`）必须用它，不能用 heads×head_dim 顶替。
+    # 0 表示「未提供」——`comm` 会据此显式报错，而不是静默用错的数。
+    hidden_size: int = 0
 
     @classmethod
     def from_hf_config(cls, config: dict[str, Any]) -> "ModelShape":
@@ -106,6 +111,7 @@ class ModelShape:
             is_mla=is_mla,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            hidden_size=hidden_size,
         )
 
     def _dtype_bytes(self, dtype: str) -> float:

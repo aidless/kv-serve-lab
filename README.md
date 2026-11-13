@@ -2,17 +2,18 @@
 
 [![CI](https://github.com/aidless/kv-serve-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/aidless/kv-serve-lab/actions/workflows/ci.yml)
 
-四个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事
-串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
+七个模块，把「KV cache 显存怎么算、块池怎么管、连续批处理怎么排、流式指标怎么量」这四件事，
+再加上「prefill/decode 该不该拆开、前缀缓存做到 token 级能多命中多少、切分之后通信要付多少」
+这三个推理引擎现场真正在权衡的问题，串成一条可以在 CPU 上跑通、可以逐项对账的闭环。
 
-纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 281 项全部通过。
+纯标准库实现，无第三方运行时依赖，`python3 -m pytest` 收 **362 项**：**359 passed + 3 skipped**（2026-11-13 本机实测；3 条 skip 是 C++ 对拍在缺 `g++/make` 时的环境降级，不是失败）。
 
 > 一个用于学习推理服务的 CPU 实验仓库，覆盖显存估算、块生命周期、调度模拟和流式度量。
 > 示例输出包含确定性模拟和本地 HTTP mock；真实 GPU 性能验证尚未完成。见 [能力边界](#能力边界)。
 
 ---
 
-## 四模块
+## 七个模块
 
 | 模块 | 干什么 | 关键口径 |
 |---|---|---|
@@ -20,6 +21,9 @@
 | `blockpool` | PagedAttention 风格的块池：引用计数、前缀复用、写时复制 | 块只有**两个分区**（free / in_use），hash 索引是叠加的弱引用，不是第三个分区 |
 | `schedsim` | 连续批处理调度模拟：统一 token 预算、chunked prefill、prefill 末步出首 token | 到达按**墙钟**判定，不按步号换算 |
 | `bench` | SSE 流式压测：TTFT / TPOT / 吞吐 | **chunk ≠ token**；`TPOT = (latency − ttft) / (output_len − 1)` |
+| `pdsim` | prefill/decode 分离的 goodput 模拟：聚合 / 分离 / 混合三种形态 | **两个池子的时钟互相独立**；分离要为跨节点 KV 传输多等一段 |
+| `radix` | token 级 radix 前缀树（SGLang RadixAttention 的骨架） | 前缀不必对齐块边界；对照块级 hash 缓存量化差额 |
+| `comm` | TP/PP 的通信代价：ring AllReduce 字节、流水线气泡 | 每 rank `2(N−1)/N × M`；气泡 `(P−1)/(M+P−1)` |
 
 ---
 
@@ -31,7 +35,7 @@ cd kv-serve-lab
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python3 -m pytest          # 281 passed
+python3 -m pytest          # 362 collected: 359 passed, 3 skipped
 python3 examples/demo.py   # 四模块闭环，全程无 GPU
 ```
 
@@ -88,7 +92,7 @@ Part 4a 是**闭环的关键**：`schedsim` 预测出的 TTFT/TPOT 被合成成 
 
 ---
 
-## 四个模块各自解决的问题
+## 七个模块各自解决的问题
 
 ### kvcalc：显存公式的三种写法，错一种就差几倍
 
@@ -230,6 +234,60 @@ usage.completion_tokens; do NOT count chunks.
 
 ---
 
+### pdsim：把 prefill 和 decode 拆开，到底什么时候更划算
+
+PD 分离（DistServe，arXiv:2401.09670）的卖点是让两个阶段互不干扰：prefill 的
+大块计算不会再插进 decode 的步子里把 TPOT 顶上去。代价是每完成一次 prefill，
+就要把这段请求的 KV cache 通过链路搬到 decode 节点——**这段时间全部加在 TTFT 上**。
+
+`pdsim` 把这条权衡做成可算的：两个池子各有自己的时钟，池内 worker 共享时钟，
+池间互不等待（这一点是全部收益的来源，第一版把两个池子锁步推进，收益直接消失）。
+
+同一批 16 个请求、**等卡**（聚合 2 张 vs 分离 1+1 张），两档 SLO：
+
+| 形态 | A 档：TTFT ≤ 0.9s / TPOT ≤ 0.05s | B 档：TTFT ≤ 5.0s / TPOT ≤ 0.008s |
+|---|---|---|
+| 聚合 2 卡 | **12/16** | 4/16 |
+| 分离 1+1 卡 | 6/16 | **16/16** |
+| 混合 1+1+1 卡（3 卡，不计入等卡对比） | 13/16 | 11/16 |
+
+读数：A 档下分离的 TPOT 明明好 3.2×（0.00452 vs 0.01460），却因为多等 0.110 s 的
+KV 传输而卡在 TTFT 上；B 档把 TTFT 放松，TPOT 的优势立刻变现成 16/16 vs 4/16。
+这就是 TaiChi（arXiv:2508.01989）说的「各有最优区间，两档都紧时两者都不最优」。
+混合形态在等卡之外，两档都没赢——分流不是免费午餐。
+
+全部数字来自解析成本模型（三个时间常数是脚本输入），不是任何真实 GPU 的实测值。
+
+### radix：token 级前缀缓存比块级多命中多少
+
+块级 hash 缓存只能复用**对齐到块边界**的前缀。SGLang 的 RadixAttention（arXiv:2312.07104）
+把前缀组织成 token 级 radix 树，于是「差几个 token 就分叉」的前缀也能命中。
+
+`radix` 模块真调 `blockpool.BlockPool(256, block_size=16)` 做基线对照（不是手写的假基线）：
+
+| 共享前缀长度 | radix 命中 | 块级命中 | 差额 |
+|---|---|---|---|
+| 8 token | 8 | 0 | 8 |
+| 24 token | 24 | 16 | 8 |
+| 40 token | 40 | 32 | 8 |
+| 56 token | 56 | 48 | 8 |
+| 32 token（对齐） | 32 | 32 | 0 |
+
+差额恒等于 `前缀长度 % 16`，对齐时打平——这条恒等式是测试断言，不是观察。
+
+### comm：切分之后要付的通信代价
+
+`comm` 只算带宽下界，不建模分层、overlap 和 chunking：
+
+- ring AllReduce 每 rank `ceil(2 × (N−1)/N × M)` 字节（N=4、M=1024 时 1536；N=1 时 0）
+- 每步通信张量 `batch × seq_len × hidden × dtype_bytes`——**hidden 不等于 heads×head_dim**
+  （Qwen3-4B 是 2560，不是 32×128=4096），所以 `kvcalc.ModelShape` 必须显式带 `hidden_size`
+- 流水线气泡 `(P−1)/(M+P−1)`（P=4、M=8 时 3/11）
+- 链路预设 `nvlink4` 450 GB/s / `pcie4_x16` 25 GB/s / `rdma_400g` 40 GB/s，全部标注
+  **厂商标称、本仓库未实测**
+
+---
+
 ## 能力边界
 
 集成层使用保守的整请求 KV 预留，事后回放块生命周期。`schedsim` 已实现逐 token 块增长、
@@ -319,16 +377,24 @@ kv_serve_lab/
   bench/        # SSE 解析 + 指标聚合
     client.py       # 真实 HTTP 流式客户端
     mock_server.py  # 可控的 SSE mock 服务端
-tests/          # 281 项，全部 CPU 可跑（含 C++ 对拍，需 g++/make）
+  pdsim/        # PD 分离 / 聚合 / 混合三形态的 goodput 模拟
+  radix/        # token 级 radix 前缀树（对照块级 hash 缓存）
+  comm/         # TP/PP 通信字节与流水线气泡
+tests/          # 362 项，全部 CPU 可跑（含 C++ 对拍，需 g++/make）
 examples/demo.py
+examples/pd_vs_agg.py            # 三形态 x 两档 SLO 的 goodput 表
 docs/superpowers/specs/2026-10-31-kv-serve-lab-design.md
+docs/superpowers/specs/2026-11-01-expansion-design.md
 ```
 
 ## 测试
 
 ```bash
-python3 -m pytest                              # 281 passed
+python3 -m pytest                              # 362 collected: 359 passed, 3 skipped
 python3 -m pytest tests/test_calibration.py -q  # 只看与真实引擎对账的那 11 项
+python3 -m pytest tests/test_pdsim.py -q        # 只看 PD 分离那 17 项
+python3 -m pytest tests/test_radix.py -q        # 只看 radix 前缀树那 41 项
+python3 -m pytest tests/test_comm.py -q         # 只看通信代价那 23 项
 python3 -m pytest tests/test_cpp_differential.py -q  # 只看 C++/Python 对拍那 10 项
 python3 -m pytest tests/test_schedsim_policy.py -q   # 只看调度策略那 12 项
 python3 -m pytest tests/test_schedsim_slo.py -q      # 只看 SLO 感知那 21 项

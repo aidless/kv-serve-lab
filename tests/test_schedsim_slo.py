@@ -15,7 +15,6 @@ import pytest
 
 from kv_serve_lab.schedsim import (
     DeadlineAwarePolicy,
-    FCFSPolicy,
     Request,
     SimConfig,
     Simulator,

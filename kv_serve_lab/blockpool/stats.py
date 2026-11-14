@@ -18,7 +18,7 @@ FIFO 队尾、无 hash 块 LIFO 队首），没有显式 eviction policy 对象�
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import BlockPool, BlockPoolError
 

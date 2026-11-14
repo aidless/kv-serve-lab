@@ -1,0 +1,129 @@
+{
+ "total": 20,
+ "passed": 20,
+ "failed": 0,
+ "selftest": false,
+ "failed_by_axis": {},
+ "results": [
+  {
+   "id": "KV-01",
+   "axis": "kvcalc/gqa",
+   "ok": true,
+   "detail": "57344"
+  },
+  {
+   "id": "KV-02",
+   "axis": "kvcalc/seq",
+   "ok": true,
+   "detail": "234881024"
+  },
+  {
+   "id": "KV-03",
+   "axis": "kvcalc/capacity",
+   "ok": true,
+   "detail": "87"
+  },
+  {
+   "id": "KV-04",
+   "axis": "kvcalc/blocks",
+   "ok": true,
+   "detail": "256"
+  },
+  {
+   "id": "KV-05",
+   "axis": "kvcalc/mla",
+   "ok": true,
+   "detail": "70272"
+  },
+  {
+   "id": "KV-06",
+   "axis": "kvcalc/mla-invariance",
+   "ok": true,
+   "detail": "70272"
+  },
+  {
+   "id": "KV-07",
+   "axis": "comm/allreduce",
+   "ok": true,
+   "detail": "1835008"
+  },
+  {
+   "id": "KV-08",
+   "axis": "comm/bubble",
+   "ok": true,
+   "detail": "0.2727272727272727"
+  },
+  {
+   "id": "KV-09",
+   "axis": "comm/hidden-size-guard",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "KV-10",
+   "axis": "blockpool/cow",
+   "ok": true,
+   "detail": "1"
+  },
+  {
+   "id": "KV-11",
+   "axis": "blockpool/full-block-only",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "KV-12",
+   "axis": "blockpool/invariant",
+   "ok": true,
+   "detail": "True"
+  },
+  {
+   "id": "KV-13",
+   "axis": "radix/shared-prefix",
+   "ok": true,
+   "detail": "7"
+  },
+  {
+   "id": "KV-14",
+   "axis": "radix/match",
+   "ok": true,
+   "detail": "5"
+  },
+  {
+   "id": "KV-15",
+   "axis": "schedsim/prefill-last-step",
+   "ok": true,
+   "detail": "504"
+  },
+  {
+   "id": "KV-16",
+   "axis": "schedsim/throughput",
+   "ok": true,
+   "detail": "399.9999999999998"
+  },
+  {
+   "id": "KV-17",
+   "axis": "schedsim/system-requests",
+   "ok": true,
+   "detail": "5.999999999999999"
+  },
+  {
+   "id": "KV-18",
+   "axis": "bench/tpot-formula",
+   "ok": true,
+   "detail": "TPOT = (latency − ttft) / (output_len − "
+  },
+  {
+   "id": "KV-19",
+   "axis": "blockpool/two-partitions",
+   "ok": true,
+   "detail": "块只有**两个分区**（free / in_use）"
+  },
+  {
+   "id": "KV-20",
+   "axis": "tests/count",
+   "ok": true,
+   "detail": "362 项**：**359 passed + 3 skipped"
+  }
+ ]
+}

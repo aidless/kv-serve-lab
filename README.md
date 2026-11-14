@@ -402,6 +402,25 @@ python3 -m pytest tests/test_schedsim_slo.py -q      # 只看 SLO 感知那 21 �
 
 学习顺序和源码入口见 [GitHub 学习地图](docs/GITHUB-MAP.md)。
 
+## 验收题库与复算
+
+`eval/cases.jsonl` 是 20 条可执行验收题，覆盖七个模块的关键口径（GQA/MLA 每 token KV、
+容量规划、ring AllReduce 字节、流水线气泡、块池引用计数与 COW、radix 共享前缀、
+调度器 token 计数与吞吐）。大部分题目的期望值不是抄文档，而是**调用模块现算**：
+
+```bash
+python3 eval/run_cases.py            # 20/20 cases passed
+python3 eval/run_cases.py --save     # 顺带把结果写进 eval/run-report.json
+python3 eval/run_cases.py --selftest # 篡改一条期望值，必须变红（证明这套题会失败）
+```
+
+**数字如何复算**：`eval/run-report.json` 里每条 case 都带 `id` / `axis` / `detail`，
+把 `detail` 与 `cases.jsonl` 的 `verify` 代码一起看，就能从源码复现该数字；
+`--save` 重跑一次即可重建整份报告，不需要手工抄数。
+
+**失败归因**：`run_cases.py` 不只报通过率，失败时按 `axis` 汇总（例如
+`kvcalc/capacity: 1 条 —— KV-03`），直接指出是哪个模块的哪个口径坏了。
+
 ## 许可
 
 MIT
